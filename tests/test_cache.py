@@ -10,7 +10,8 @@ from test_inbox import inbox, row
 
 class CacheTests(unittest.TestCase):
     def setUp(self) -> None:
-        for name, value in [('REFERENCE_CACHE', {}), ('MESSAGE_CACHE', OrderedDict()), ('CONTACTS', [])]:
+        for name, value in [('REFERENCE_CACHE', {}), ('MESSAGE_CACHE', OrderedDict()), ('CONTACTS', []),
+                            ('FOLDER_CACHE', {}), ('HEADER_CACHE_PATH', None), ('MESSAGE_READS', {})]:
             override = patch.object(inbox, name, value)
             override.start()
             self.addCleanup(override.stop)
@@ -33,11 +34,14 @@ class CacheTests(unittest.TestCase):
             for number in range(20):
                 inbox.read_raw(row('one', str(number), str(number)))
         self.assertEqual(len(inbox.MESSAGE_CACHE), 16)
-        self.assertNotIn(('one', 'inbox', '0'), inbox.MESSAGE_CACHE)
+        self.assertNotIn(inbox.message_cache_key(row('one', '0', '0')), inbox.MESSAGE_CACHE)
         with patch.object(inbox, 'run_himalaya', return_value={'message': 'x' * (1024 * 1024 + 1)}):
             inbox.read_raw(row('one', 'large', 'large'))
         self.assertEqual(len(inbox.MESSAGE_CACHE), 16)
-        self.assertNotIn(('one', 'inbox', 'large'), inbox.MESSAGE_CACHE)
+        self.assertIn(inbox.message_cache_key(row('one', 'large', 'large')), inbox.MESSAGE_CACHE)
+        with patch.object(inbox, 'run_himalaya', return_value={'message': 'x' * (32 * 1024 * 1024 + 1)}):
+            inbox.read_raw(row('one', 'oversized', 'oversized'))
+        self.assertNotIn(inbox.message_cache_key(row('one', 'oversized', 'oversized')), inbox.MESSAGE_CACHE)
 
     def test_failed_reads_are_not_cached(self) -> None:
         item = row('one', '42', 'message')
@@ -68,7 +72,7 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(item['references'], ['correct'])
 
     def test_refresh_clears_bodies_updates_flags_and_prunes_old_references(self) -> None:
-        inbox.MESSAGE_CACHE[('one', 'inbox', '1')] = 'old'
+        inbox.MESSAGE_CACHE[inbox.message_cache_key(row('one', '1', 'old'))] = 'old'
         inbox.REFERENCE_CACHE[('one', 'removed')] = ('root',)
         latest = dict(row('one', '1', 'new'), references=['root'], flags=[{'iana': 'seen'}])
         anonymous = dict(row('one', '2', None), references=[])
@@ -95,6 +99,7 @@ class CacheTests(unittest.TestCase):
         ]
         with patch.object(inbox, 'SETTINGS', {'one': {'imap': {}}}), \
                 patch.object(inbox, 'run_himalaya', return_value={'mailboxes': boxes}), \
+                patch.object(inbox, 'mailbox_states', return_value={}), \
                 patch.object(inbox, 'fetch', side_effect=fetch) as fetch_mock, \
                 patch.object(inbox, 'add_references'):
             rows = inbox.load_account('one')

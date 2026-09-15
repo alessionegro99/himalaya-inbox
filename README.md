@@ -14,6 +14,7 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Replies, replies to all, and composes new mail in Neovim.
 - Attaches local files to new messages and replies, with a file picker and removable attachments.
 - Suggests recipients automatically by name or address in Neovim's To/Cc fields.
+- Opens cached headers immediately, checks for new mail in the background, and preloads the highlighted message.
 - Shows the message for review and queues it with a cancellable five-minute delay by default.
 - Offers a custom delay or an explicit send-now confirmation.
 - Keeps unfinished drafts locally so you can resume them.
@@ -38,7 +39,11 @@ Ensure `~/.local/bin` is on your PATH. The script uses `uv` to run Python withou
 
 It reads your existing configuration from `$HIMALAYA_CONFIG`, or `$XDG_CONFIG_HOME/himalaya/config.toml` (default `~/.config/himalaya/config.toml`). Use `--config /path/to/config.toml` for a different **single** configuration file. Split/merged config paths are not supported. `HIMALAYA_BIN` can select a different Himalaya executable.
 
-Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Trash/Junk and their configured equivalents. Initial loading still requires network access; there is no persistent mail index. It checks up to two folders concurrently per account. Refresh updates envelope lists and flags, but reuses known messages' threading headers. Recently opened messages are kept in memory for quick reopening/replying; refresh clears that body cache.
+Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Trash/Junk and their configured equivalents. The first launch builds a private local header index. Later launches show that index immediately while checking for new mail; the footer identifies the previous headers until synchronization completes. Press `u` to refresh in the background without blocking navigation. Failed refreshes retain the previous view and show a warning.
+
+Folder discovery and change checks run concurrently. On servers supporting persistent `HIGHESTMODSEQ`, matching UID validity, UID-next, message count and modification sequence allow unchanged folders to reuse their indexed headers. Servers without usable modification sequences still get full header/flag checks, so read/unread changes in other clients are not missed. The selected conversation/message stays selected when new mail arrives.
+
+The highlighted message is preloaded read-only. Opening it shares any in-flight download instead of starting another one. Recently opened messages and normal-sized attachments stay in a bounded RAM cache across refreshes if their identities still match. Press `q` to leave a loading message; quitting the client stops its outstanding background read processes. Message bodies are not persisted on disk by this cache.
 
 ## Keys
 
@@ -57,7 +62,7 @@ Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own
 | `t` | Toggle conversation grouping |
 | `/` | Filter the list or search an open message |
 | Escape | Clear the list filter |
-| `u` | Refresh mail, including sent replies |
+| `u` | Refresh mail in the background, including sent replies |
 | `q` | Go back or quit |
 
 Within a conversation, messages are oldest first. `You (sent)` identifies sent copies. A reply from a conversation summary targets its latest received message; open the conversation and select another message to reply to that one instead.
@@ -149,7 +154,8 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 
 - Authentication stays with Himalaya and its configured helpers. This wrapper does not print their raw output, errors, or credentials.
 - Browsing uses read-only/peek fetching and does not mark messages read.
-- Message bodies are fetched only when opened or used to prepare a reply. A memory-only cache retains at most 16 messages, each at most 1 MiB of UTF-8 text, until refresh or exit. Large messages/attachments are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
+- Headers (including subjects and From/To addresses) are cached as **plaintext** under `$XDG_CACHE_HOME/himalaya-inbox` (default `~/.cache/himalaya-inbox`), with directory permissions 700 and file permissions 600. This cache contains no message bodies, Bcc fields, passwords, OAuth tokens, or account configuration. It is isolated by a hash of the configuration and written atomically. Removing this directory forces a full header reload next time.
+- Message bodies are fetched when highlighted, opened, or used to prepare a reply, without marking messages read. The RAM cache retains at most 16 messages, at most 32 MiB each and 64 MiB combined in UTF-8 encoding, until exit. Refresh preserves only bodies whose account/folder/UID validity/UID/Message-ID still match. Larger messages are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
 - Recipient suggestions are collected in memory from loaded address headers, not bodies or Bcc. While editing, Neovim receives a private temporary JSON file (permissions 600 inside a 700 directory), removed when the editor returns. No contacts database, mail cache, or personal editor configuration is included in this repository.
 - Drafts are **plaintext**, stored outside the repository under `$XDG_STATE_HOME/himalaya-inbox/drafts` (default `~/.local/state/himalaya-inbox/drafts`). Directory permissions are 700 and draft files start at 600. Protect the laptop/account and its backups accordingly.
 - The scheduled Outbox is also **plaintext**, in `himalaya-inbox/outbox.sqlite3` beside the drafts directory (permissions 600). Pending or uncertain deliveries retain their bodies. Successful deliveries and cancelled entries retain only status metadata; their queued bodies are removed. This is not a guarantee that older backups contain no copies.
@@ -167,11 +173,11 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts, bounded caches, concurrent folder loading, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending and attachment viewers are mocked; no real messages are sent.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending and attachment viewers are mocked; no real messages are sent.
 
 ## Scope and upstream credit
 
-This is a small personal interface, not a full replacement for Thunderbird. Encryption/signing, remote draft synchronization, server-side deletion, and persistent/offline mail indexing are not implemented. Only one configuration file is supported.
+This is a small personal interface, not a full replacement for Thunderbird. Encryption/signing, remote draft synchronization, server-side deletion, and persistent/offline message-body storage are not implemented. Cached headers can be browsed offline; opening an uncached body still needs the server. Only one configuration file is supported.
 
 The transport/backend work is provided by [Pimalaya's Himalaya](https://github.com/pimalaya/himalaya). Thread identifiers follow [RFC 5322 §3.6.4](https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4); header-only fetching follows [IMAP RFC 3501](https://www.rfc-editor.org/rfc/rfc3501). Python's standard-library `email` and `curses` modules provide MIME handling and the terminal interface.
 
