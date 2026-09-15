@@ -1,0 +1,89 @@
+"""Real Neovim handoff with synthetic mail; sending is replaced by an in-memory check."""
+
+import curses
+import fcntl
+import os
+import pty
+import select
+import shutil
+import signal
+import struct
+import tempfile
+import termios
+import time
+import unittest
+from pathlib import Path
+
+from test_inbox import inbox, row
+from test_reply import CONFIG, SOURCE
+
+
+@unittest.skipUnless(shutil.which('nvim'), 'Neovim is not installed')
+class EditorIntegrationTests(unittest.TestCase):
+    def test_actual_editor_cancel_and_confirmed_mock_send(self) -> None:
+        for send in (False, True):
+            with self.subTest(send=send), tempfile.TemporaryDirectory() as directory:
+                pid, master = pty.fork()
+                if pid == 0:
+                    try:
+                        os.environ['TERM'] = 'xterm-256color'
+                        inbox.SETTINGS = CONFIG
+                        inbox.draft_directory = lambda: Path(directory)
+                        inbox.read_raw = lambda _: SOURCE
+                        sent = []
+
+                        def mock_send(account, message):
+                            assert account == 'work'
+                            assert 'Synthetic editor reply' in message.get_content()
+                            assert str(message['To']) == 'reply@example.net'
+                            sent.append(message)
+                            return 'SENT. Synthetic transport only.'
+
+                        inbox.send_confirmed = mock_send
+                        curses.wrapper(inbox.compose, row('work', '1', 'one'))
+                        assert bool(sent) == send
+                        os.write(1, b'EDITOR_TEST_FINISHED\n')
+                        os._exit(0)
+                    except BaseException:
+                        os._exit(1)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 28, 110, 0, 0))
+                buffer = bytearray()
+
+                def expect(marker):
+                    deadline = time.monotonic() + 12
+                    while marker not in buffer:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AssertionError('Synthetic editor test did not reach expected state')
+                        if select.select([master], [], [], remaining)[0]:
+                            buffer.extend(os.read(master, 65536))
+                    buffer.clear()
+
+                try:
+                    expect(b'X-Himalaya-Account')
+                    os.write(master, b'GoSynthetic editor reply\x1b:wq\r')
+                    expect(b'REVIEW')
+                    if send:
+                        os.write(master, b's')
+                        expect(b'Type SEND')
+                        os.write(master, b'SEND\r')
+                        expect(b'Synthetic transport only')
+                    os.write(master, b'q')
+                    expect(b'EDITOR_TEST_FINISHED')
+                    _, status = os.waitpid(pid, 0)
+                    self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                    paths = list(Path(directory).glob('draft-*.txt'))
+                    self.assertEqual(len(paths), 0 if send else 1)
+                except BaseException:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        os.waitpid(pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    raise
+                finally:
+                    os.close(master)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,885 @@
+#!/usr/bin/env -S uv run --no-project --python 3.12 --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Interactive unified inbox for Himalaya 2.1, with private local drafts.
+
+CLI and envelope format:
+https://github.com/pimalaya/himalaya/tree/v2.1.0
+See `himalaya envelope list --help` and its generated JSON schema.
+Terminal API: https://docs.python.org/3/library/curses.html
+Reply identifiers: https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4
+"""
+
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
+import curses
+from datetime import datetime, timezone
+from email import policy
+from email.message import EmailMessage
+from email.parser import Parser
+from email.utils import format_datetime, formataddr, getaddresses, make_msgid
+from html.parser import HTMLParser
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import tomllib
+from contextlib import contextmanager
+
+
+HIMALAYA = os.environ.get('HIMALAYA_BIN') or shutil.which('himalaya') or str(Path.home() / '.local/bin/himalaya')
+SETTINGS: dict = {}
+CONFIG_ARGS: list[str] = []
+
+
+def run_private(args: list[str], data: bytes | None = None) -> bytes:
+    """Capture diagnostics privately, including authentication-helper output."""
+    try:
+        result = subprocess.run(
+            [HIMALAYA, '--log-level', 'off', *CONFIG_ARGS, *args], input=data,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        if result.returncode != 0:
+            raise RuntimeError('Himalaya command failed; private diagnostics suppressed.')
+        return result.stdout
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        raise RuntimeError('Himalaya timed out or returned invalid output; private diagnostics suppressed.') from None
+
+
+def run_himalaya(args: list[str]) -> dict:
+    """Decode only successful JSON responses; never expose malformed output."""
+    try:
+        return json.loads(run_private(['--json', *args]))
+    except ValueError:
+        raise RuntimeError('Himalaya returned invalid JSON; private diagnostics suppressed.') from None
+
+
+def fetch(account: str, limit: int | None, mailbox: str = 'inbox') -> list[dict]:
+    """Fetch enough sorted headers for a global limit, or paginate the whole inbox."""
+    page_size = min(limit, 500) if limit is not None else 500
+    rows = {}
+    page = 1
+    try:
+        while True:
+            batch = run_himalaya([
+                '--account', account, 'envelope', 'list', '--mailbox', mailbox,
+                '--page', str(page), '--page-size', str(page_size),
+            ])['envelopes']
+            previous_count = len(rows)
+            for envelope in batch:
+                # Keep account-scoped IDs; different accounts can share a UID.
+                rows[str(envelope['id'])] = dict(envelope, account=account, mailbox=mailbox)
+            if len(batch) < page_size or (limit is not None and len(rows) >= limit):
+                break
+            if len(rows) == previous_count:
+                raise RuntimeError('Pagination made no progress.')
+            page += 1
+    except (RuntimeError, KeyError, TypeError):
+        raise RuntimeError(f'Could not list {account}; no partial unified inbox was displayed.') from None
+    return list(rows.values())
+
+
+def message_ids(value: object) -> list[str]:
+    """Extract RFC 5322 IDs without case folding the case-sensitive local part."""
+    return re.findall(r'<([^<>\s]+)>', str(value or ''))
+
+
+def normalized_id(value: str | None) -> str:
+    """Himalaya versions may include or omit the surrounding angle brackets."""
+    return (value or '').strip().strip('<>')
+
+
+def imap_mailbox(name: str) -> str:
+    """Encode modified UTF-7 (RFC 3501 §5.1.3) and quote an IMAP mailbox.
+
+    Backslashes are rejected because Himalaya raw decodes literal \\n/\\r.
+    https://www.rfc-editor.org/rfc/rfc3501#section-5.1.3
+    """
+    if any(not c.isprintable() or c == '\\' for c in name):
+        raise RuntimeError('Unsupported mailbox name for safe header fetching.')
+    parts = []
+    pending = ''
+    for char in name + '\x00':
+        if ord(char) >= 127:
+            pending += char
+            continue
+        if pending:
+            parts.append('&' + base64.b64encode(pending.encode('utf-16-be')).decode().rstrip('=').replace('/', ',') + '-')
+            pending = ''
+        if char != '\x00':
+            parts.append('&-' if char == '&' else char)
+    return '"' + ''.join(parts).replace('"', '\\"') + '"'
+
+
+def parse_reference_fetch(output: bytes) -> dict[str, list[str]]:
+    """Read length-delimited IMAP header literals, not message bodies."""
+    result = {}
+    position = 0
+    protocol = []
+    pattern = re.compile(rb'\* \d+ FETCH \([^\r\n]*\{(\d+)\}\r\n', re.I)
+    while match := pattern.search(output, position):
+        end = match.end() + int(match[1])
+        if end > len(output):
+            raise RuntimeError('Truncated threading headers.')
+        suffix_end = output.find(b'\r\n', end)
+        if suffix_end < 0:
+            raise RuntimeError('Incomplete threading response.')
+        protocol.append(output[position:match.end()])
+        uid = re.search(rb'\bUID (\d+)\b', match[0] + output[end:suffix_end], re.I)
+        if not uid:
+            raise RuntimeError('Threading header lacked its mailbox UID.')
+        headers = Parser(policy=policy.default).parsestr(output[match.end():end].decode('utf-8', 'replace'), headersonly=True)
+        result[uid[1].decode()] = message_ids(headers.get('References'))
+        position = end
+    protocol.append(output[position:])
+    safe_protocol = b''.join(protocol)
+    for tag in (b'hi1', b'hi2'):
+        if not re.search(rb'^' + tag + rb' OK\b', safe_protocol, re.M | re.I):
+            raise RuntimeError('Server could not provide threading headers.')
+    return result
+
+
+def add_references(account: str, mailbox: str, rows: list[dict]) -> None:
+    """Fetch all ancestry headers in batches with EXAMINE and BODY.PEEK."""
+    for start in range(0, len(rows), 250):
+        batch = rows[start:start + 250]
+        if any(not str(row['id']).isdigit() for row in batch):
+            raise RuntimeError('Full threading currently requires IMAP accounts.')
+        sequence = ','.join(str(row['id']) for row in batch)
+        commands = (f'hi1 EXAMINE {imap_mailbox(mailbox)}\r\n'
+                    f'hi2 UID FETCH {sequence} (UID BODY.PEEK[HEADER.FIELDS (REFERENCES)])\r\n')
+        # Himalaya 2.1's stdin parser strips the final line ending, then its raw
+        # command appends bare LF. Gmail requires CRLF. An extra empty stdin line
+        # preserves the terminating CRLF after lines().join("\r\n").
+        # https://github.com/pimalaya/himalaya/blob/v2.1.0/src/shared/raw.rs
+        refs = parse_reference_fetch(run_private(['--account', account, 'imap', 'raw'], (commands + '\r\n').encode()))
+        if any(str(row['id']) not in refs for row in batch):
+            raise RuntimeError('Mailbox changed while fetching threading headers; refresh to retry.')
+        for row in batch:
+            row['references'] = refs[str(row['id'])]
+
+
+def load_account(account: str) -> list[dict]:
+    """Index selectable folders except Drafts, Trash and Junk; no body cache."""
+    settings = SETTINGS[account]
+    if 'imap' not in settings:
+        raise RuntimeError('Full conversation browsing currently requires IMAP accounts.')
+    aliases = settings.get('mailbox', {}).get('alias', {})
+    boxes = run_himalaya(['--account', account, 'imap', 'list', '--all'])['mailboxes']
+    excluded = {aliases.get(role, '').casefold() for role in ('drafts', 'trash', 'junk', 'spam')}
+    excluded |= {'drafts', 'trash', 'junk', 'spam', 'deleted', 'deleted items', 'cestino', 'bozze'}
+    all_rows = []
+    for box in boxes:
+        mailbox = box['name']
+        attrs = {a.casefold().lstrip('\\') for a in box['attributes']}
+        if attrs & {'noselect', 'drafts', 'trash', 'junk'}:
+            continue
+        leaf = mailbox.rsplit('/', 1)[-1].casefold()
+        delimiter = box.get('delimiter') or '/'
+        is_excluded = any(value and (mailbox.casefold() == value or mailbox.casefold().startswith(value + delimiter))
+                          for value in excluded)
+        if is_excluded or leaf in excluded or mailbox in ('[Gmail]', '[Google Mail]'):
+            continue
+        try:
+            rows = fetch(account, None, mailbox)
+            add_references(account, mailbox, rows)
+        except RuntimeError as error:
+            raise RuntimeError(f'{clean(account)} / {clean(mailbox)}: {error}') from None
+        for row in rows:
+            row['in_inbox'] = mailbox.casefold() == aliases.get('inbox', 'INBOX').casefold()
+            row['sent'] = mailbox == aliases.get('sent') or 'sent' in attrs
+        all_rows.extend(rows)
+    return all_rows
+
+
+def deduplicate(rows: list[dict]) -> list[dict]:
+    """Merge label/folder copies within an account; keep their exact read location."""
+    unique = {}
+    # Prefer Inbox over Sent over Archive when one message has multiple labels.
+    for row in sorted(rows, key=lambda r: (not r.get('in_inbox', False), not r.get('sent', False))):
+        key = (row['account'], normalized_id(row.get('message-id')) or (row.get('mailbox'), str(row['id'])))
+        if key not in unique:
+            unique[key] = dict(row)
+        else:
+            unique[key]['sent'] = unique[key].get('sent', False) or row.get('sent', False)
+    return merge([list(unique.values())], None)
+
+
+def load_all() -> list[dict]:
+    """Load accounts in parallel; fail visibly instead of hiding incomplete threads."""
+    with ThreadPoolExecutor(max_workers=min(len(SETTINGS), 5)) as pool:
+        return deduplicate([row for batch in pool.map(load_account, SETTINGS) for row in batch])
+
+
+def message_date(row: dict) -> datetime:
+    """Normalize offsets for ordering; place absent or invalid dates last."""
+    try:
+        value = datetime.fromisoformat(row.get('date') or '')
+        if value.tzinfo is None:
+            raise ValueError('Date lacks a timezone')
+        return value.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def merge(batches: list[list[dict]], limit: int | None) -> list[dict]:
+    """Merge descending lists; the global newest N are in each account's top N."""
+    rows = [row for batch in batches for row in batch]
+    rows.sort(key=lambda row: (message_date(row), row['account'], str(row['id'])), reverse=True)
+    return rows if limit is None else rows[:limit]
+
+
+def clean(value: object) -> str:
+    """Strip terminal controls and collapse header whitespace before display."""
+    return ' '.join(''.join(char if char.isprintable() else ' ' for char in str(value)).split())
+
+
+def is_unread(row: dict) -> bool:
+    """Inspect flags without modifying the message."""
+    return not any(
+        flag.get('iana') == 'seen' or flag.get('raw', '').lower() == '\\seen'
+        for flag in row.get('flags', [])
+    )
+
+
+def conversations(rows: list[dict]) -> list[list[dict]]:
+    """Group connected reply IDs; never infer relationships from subjects.
+
+    Connected components via iterative depth-first search. Shared absent parents
+    still connect siblings. Himalaya normalizes Message-ID and In-Reply-To alike.
+    https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.components.connected_components.html
+    References connect ancestors even when an intermediate message is absent.
+    All account-specific message copies are retained.
+    """
+    graph = [set() for _ in rows]
+    owners = {}
+    for index, row in enumerate(rows):
+        for token in [row.get('message-id'), *(row.get('in-reply-to') or []), *(row.get('references') or [])]:
+            token = normalized_id(token)
+            if token:
+                other = owners.setdefault(token, index)
+                graph[index].add(other)
+                graph[other].add(index)
+    seen = set()
+    groups = []
+    for start in range(len(rows)):
+        if start in seen:
+            continue
+        pending = [start]
+        members = []
+        seen.add(start)
+        while pending:
+            index = pending.pop()
+            members.append(index)
+            for other in graph[index] - seen:
+                seen.add(other)
+                pending.append(other)
+        groups.append([rows[index] for index in sorted(members)])
+    return groups
+
+
+class HtmlText(HTMLParser):
+    """Extract readable text without running scripts or fetching remote content."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {'head', 'script', 'style'}:
+            self.hidden += 1
+        if not self.hidden and tag in {'br', 'p', 'div', 'tr', 'li', 'h1', 'h2', 'h3', 'hr'}:
+            self.parts.append('\n')
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {'head', 'script', 'style'}:
+            self.hidden = max(0, self.hidden - 1)
+        if not self.hidden and tag in {'p', 'div', 'tr', 'li', 'h1', 'h2', 'h3'}:
+            self.parts.append('\n')
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden:
+            self.parts.append(' '.join(data.split()) + ' ')
+
+
+def message_text(raw: str, row: dict) -> str:
+    """Decode MIME, prefer plain text, and remove terminal control characters."""
+    message = Parser(policy=policy.default).parsestr(raw)
+    lines = [f"Account: {clean(row['account'])}   Folder: {clean(row.get('mailbox', 'inbox'))}   ID: {clean(row['id'])}"]
+    for header in ('Date', 'From', 'To', 'Cc', 'Subject'):
+        if message.get(header):
+            lines.append(f'{header}: {clean(message[header])}')
+    lines.append('')
+    body = message.get_body(preferencelist=('plain', 'html'))
+    if body is None:
+        lines.append('[No readable text body; this message may contain attachments or encrypted content.]')
+    else:
+        content = body.get_content()
+        if body.get_content_type() == 'text/html':
+            parser = HtmlText()
+            parser.feed(content)
+            content = '\n'.join(line.strip() for line in ''.join(parser.parts).splitlines() if line.strip())
+        lines.append(content)
+    attachments = [clean(part.get_filename() or part.get_content_type())
+                   for part in message.walk()
+                   if part.get_content_disposition() == 'attachment' or part.get_filename()]
+    if attachments:
+        lines.extend(['', 'Attachments (not opened):', *attachments])
+    text = '\n'.join(lines).replace('\r\n', '\n').replace('\r', '\n')
+    return ''.join(char for char in text if char.isprintable() or char in '\n\t') + '\n'
+
+
+def read_raw(row: dict) -> str:
+    """Read the exact account/folder/UID, never marking a message seen."""
+    try:
+        result = run_himalaya([
+            '--account', row['account'], 'message', 'read',
+            '--mailbox', row.get('mailbox', 'inbox'), '--raw', '--', str(row['id']),
+        ])
+        if not isinstance(result.get('message'), str):
+            raise ValueError('Unexpected message format')
+        return result['message']
+    except Exception:
+        # A backend or MIME error could contain credentials or private mail.
+        raise RuntimeError('Could not open this message; private diagnostics suppressed.') from None
+
+
+def read_message(row: dict) -> str:
+    """Render safely, keeping MIME exceptions out of diagnostics."""
+    try:
+        return message_text(read_raw(row), row)
+    except Exception:
+        raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
+
+
+def show_message(screen: curses.window, row: dict) -> None:
+    """Read a message and reply without leaving the interactive browser."""
+    screen.erase()
+    put_line(screen, 0, 'Opening message (read-only)...')
+    screen.refresh()
+    text = read_message(row)
+    status = ''
+    while True:
+        key = text_view(screen, text, 'r reply | R reply all | / search | q back', {'r', 'R', 'q'}, status)
+        if key == 'q':
+            return
+        status = compose(screen, row, reply_all=key == 'R')
+
+
+@contextmanager
+def terminal_child(screen: curses.window):
+    """Temporarily hand the terminal to an editor and restore it on every exit."""
+    curses.mousemask(0)
+    curses.def_prog_mode()
+    curses.endwin()
+    try:
+        yield
+    finally:
+        curses.reset_prog_mode()
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        screen.keypad(True)
+        screen.clearok(True)
+
+
+def input_line(screen: curses.window, prompt: str) -> str | None:
+    """Read one line with Escape to cancel, without terminal escape echo."""
+    value = ''
+    while True:
+        y = screen.getmaxyx()[0] - 1
+        screen.move(y, 0)
+        screen.clrtoeol()
+        put_line(screen, y, prompt + value, curses.A_BOLD)
+        screen.refresh()
+        key = screen.get_wch()
+        if key == '\x1b':
+            return None
+        if key in ('\n', '\r', curses.KEY_ENTER):
+            return value
+        if key in ('\b', '\x7f', curses.KEY_BACKSPACE):
+            value = value[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            value += key
+
+
+def text_view(screen: curses.window, text: str, help_text: str,
+              actions: set[str], status: str = '') -> str:
+    """Scrollable, searchable text with keyboard/mouse navigation and actions."""
+    offset = 0
+    query = ''
+    while True:
+        height, width = screen.getmaxyx()
+        page = max(1, height - 2)
+        lines = [part for line in text.splitlines()
+                 for part in (textwrap.wrap(line.expandtabs(4), max(1, width - 2), replace_whitespace=False) or [''])]
+        offset = max(0, min(offset, max(0, len(lines) - page)))
+        screen.erase()
+        put_line(screen, 0, help_text, curses.A_BOLD)
+        for y, line in enumerate(lines[offset:offset + page], 1):
+            put_line(screen, y, line)
+        put_line(screen, height - 1, status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | arrows/wheel scroll')
+        screen.refresh()
+        key = screen.get_wch()
+        if isinstance(key, str) and key in actions:
+            return key
+        if key in ('j', curses.KEY_DOWN):
+            offset += 1
+        elif key in ('k', curses.KEY_UP):
+            offset -= 1
+        elif key in (' ', '\x06', curses.KEY_NPAGE):
+            offset += page
+        elif key in ('\x02', curses.KEY_PPAGE):
+            offset -= page
+        elif key in ('g', curses.KEY_HOME):
+            offset = 0
+        elif key in ('G', curses.KEY_END):
+            offset = len(lines)
+        elif key == curses.KEY_MOUSE:
+            try:
+                buttons = curses.getmouse()[4]
+                offset += 3 if buttons & getattr(curses, 'BUTTON5_PRESSED', 0) else -3 if buttons & curses.BUTTON4_PRESSED else 0
+            except curses.error:
+                pass
+        elif key in ('/', 'n'):
+            if key == '/':
+                query = input_line(screen, 'Find: ') or ''
+            if query:
+                matches = [i for i, line in enumerate(lines) if query.casefold() in line.casefold()]
+                if matches:
+                    offset = next((i for i in matches if i > offset), matches[0])
+                else:
+                    status = 'No match.'
+
+
+def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
+    """Select an account or saved draft without entering a shell command."""
+    index = 0
+    while choices:
+        screen.erase()
+        put_line(screen, 0, title + ' | Enter select | q cancel', curses.A_BOLD)
+        page = max(1, screen.getmaxyx()[0] - 2)
+        top = max(0, index - page + 1)
+        for y, item in enumerate(choices[top:top + page], 1):
+            put_line(screen, y, item, curses.A_REVERSE if top + y - 1 == index else 0)
+        screen.refresh()
+        key = screen.get_wch()
+        if key in ('q', '\x1b'):
+            return None
+        if key in ('\n', '\r', curses.KEY_ENTER):
+            return index
+        if key in ('j', curses.KEY_DOWN):
+            index = min(len(choices) - 1, index + 1)
+        elif key in ('k', curses.KEY_UP):
+            index = max(0, index - 1)
+    return None
+
+
+def draft_directory() -> Path:
+    """Keep mail drafts out of the working directory and any source repository."""
+    path = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'himalaya-inbox/drafts'
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def reply_template(raw: str, account: str, reply_all: bool = False) -> str:
+    """Preserve RFC 5322 ancestry and honor Reply-To, excluding own addresses."""
+    source = Parser(policy=policy.default).parsestr(raw)
+    own = {a['email'].casefold() for a in SETTINGS.values()}
+    sender_is_self = any(address.casefold() in own for _, address in getaddresses(source.get_all('From', [])))
+    recipients = source.get_all('To', []) if sender_is_self else source.get_all('Reply-To', []) or source.get_all('From', [])
+    if reply_all:
+        recipients += source.get_all('To', [])
+    used = set(own)
+
+    def addresses(values: list[str]) -> str:
+        output = []
+        for name, address in getaddresses([str(value) for value in values]):
+            if address and address.casefold() not in used:
+                used.add(address.casefold())
+                output.append(formataddr((clean(name), address)))
+        return ', '.join(output)
+
+    to = addresses(recipients)
+    cc = addresses(source.get_all('Cc', [])) if reply_all else ''
+    subject = clean(source.get('Subject', ''))
+    if not re.match(r'^re\s*:', subject, re.I):
+        subject = 'Re: ' + subject
+    parent = message_ids(source.get('Message-ID'))
+    refs = message_ids(source.get('References')) or message_ids(source.get('In-Reply-To'))
+    refs = list(dict.fromkeys([*refs, *parent]))
+    quoted = message_text(raw, {'account': account, 'id': ''}).split('\n\n', 1)[-1]
+    headers = [f'X-Himalaya-Account: {account}', f'To: {to}', f'Cc: {cc}', f'Subject: {subject}']
+    if parent:
+        headers.append('In-Reply-To: ' + ' '.join(f'<{v}>' for v in parent))
+    if refs:
+        headers.append('References: ' + ' '.join(f'<{v}>' for v in refs))
+    return '\n'.join(headers) + '\n\n\n\n' + '\n'.join('> ' + line for line in quoted.splitlines()) + '\n'
+
+
+def build_message(draft: str) -> tuple[str, EmailMessage]:
+    """Validate editable fields and construct the exact message to confirm/send."""
+    parsed = Parser(policy=policy.default).parsestr(draft)
+    allowed = {'x-himalaya-account', 'to', 'cc', 'subject', 'in-reply-to', 'references'}
+    if any(key.lower() not in allowed for key in parsed.keys()) or parsed.defects:
+        raise RuntimeError('Draft has unsupported headers; keep Account, To, Cc, Subject and reply identifiers only.')
+    if any(len(parsed.get_all(key, [])) > 1 for key in allowed):
+        raise RuntimeError('Draft has duplicate headers.')
+    account = str(parsed.get('X-Himalaya-Account', '')).strip()
+    if account not in SETTINGS:
+        raise RuntimeError('Draft account is not configured.')
+    message = EmailMessage(policy=policy.SMTP)
+    identity = SETTINGS[account]
+    message['From'] = formataddr((identity.get('display-name', ''), identity['email']))
+    for key in ('To', 'Cc'):
+        value = parsed.get(key)
+        if value:
+            if value.defects or any(not a.username or not a.domain for a in value.addresses):
+                raise RuntimeError(f'Invalid {key} address; edit the draft.')
+            message[key] = str(value)
+    if not message.get('To') and not message.get('Cc'):
+        raise RuntimeError('Add at least one recipient.')
+    message['Subject'] = str(parsed.get('Subject', ''))
+    for key in ('In-Reply-To', 'References'):
+        ids = message_ids(parsed.get(key))
+        if ids:
+            message[key] = ' '.join(f'<{value}>' for value in ids)
+    message['Date'] = format_datetime(datetime.now().astimezone())
+    message['Message-ID'] = make_msgid(domain=identity['email'].rsplit('@', 1)[-1])
+    body = parsed.get_payload()
+    if not isinstance(body, str) or not body.strip():
+        raise RuntimeError('The reply body is empty.')
+    message.set_content(body, charset='utf-8')
+    return account, message
+
+
+def send_confirmed(account: str, message: EmailMessage) -> str:
+    """Send once, then save Sent separately; never retry an uncertain delivery."""
+    payload = message.as_bytes()
+    try:
+        run_private(['--account', account, 'message', 'send'], payload)
+    except RuntimeError:
+        return 'Delivery is uncertain. Check Sent before retrying; your draft is kept.'
+    # Gmail SMTP already saves Sent mail. Other providers need an explicit copy.
+    host = SETTINGS[account].get('smtp', {}).get('server', '')
+    if not re.search(r'(^|://)smtp\.(gmail|googlemail)\.com(?::|$)', host):
+        try:
+            run_private(['--account', account, 'message', 'add', '--mailbox', 'sent', '--flag', 'seen'], payload)
+        except RuntimeError:
+            return 'SENT, but saving the Sent copy failed. Do NOT resend; your draft is kept.'
+    return 'SENT. Press u in the message list to refresh the conversation.'
+
+
+def compose(screen: curses.window, row: dict | None = None, reply_all: bool = False,
+            draft_path: Path | None = None) -> str:
+    """Edit in Neovim; saving or quitting the editor never sends a message."""
+    if not SETTINGS:
+        return 'Replying requires account settings; reopen the browser normally.'
+    if draft_path is None:
+        if row is not None:
+            template = reply_template(read_raw(row), row['account'], reply_all)
+        else:
+            accounts = list(SETTINGS)
+            index = choose(screen, 'Send from account', accounts)
+            if index is None:
+                return 'Compose cancelled.'
+            template = f'X-Himalaya-Account: {accounts[index]}\nTo: \nCc: \nSubject: \n\n'
+        descriptor, name = tempfile.mkstemp(prefix='draft-', suffix='.txt', dir=draft_directory())
+        draft_path = Path(name)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as file:
+            file.write(template)
+    editor = shutil.which('nvim')
+    if not editor:
+        return 'Neovim is unavailable; draft kept. Press d to resume later.'
+    while True:
+        # No plugins/modelines/swap/undo/shada: untrusted quoted mail must not
+        # execute editor code, and draft contents must not leak into other caches.
+        with terminal_child(screen):
+            result = subprocess.run([editor, '-u', 'NONE', '-n', '-i', 'NONE', '--cmd',
+                                     'set nomodeline noswapfile nobackup nowritebackup noundofile',
+                                     '+set filetype=mail', '--', str(draft_path)])
+        if result.returncode:
+            return 'Editor cancelled; draft kept. Press d to resume.'
+        try:
+            account, message = build_message(draft_path.read_text(encoding='utf-8'))
+        except (RuntimeError, ValueError, OSError) as error:
+            reason = str(error) if isinstance(error, RuntimeError) else 'Draft could not be parsed.'
+            choice = text_view(screen, reason, 'e edit | q keep draft', {'e', 'q'})
+            if choice == 'e':
+                continue
+            return 'Draft kept. Press d to resume.'
+        preview = message_text(message.as_string(), {'account': account, 'id': 'new draft'})
+        choice = text_view(screen, preview, 'REVIEW | s send | e edit | q keep draft', {'s', 'e', 'q'})
+        if choice == 'e':
+            continue
+        if choice != 's' or input_line(screen, 'Type SEND to send this message: ') != 'SEND':
+            return 'Not sent. Draft kept; press d to resume.'
+        screen.erase()
+        put_line(screen, 0, 'Sending once; please wait...')
+        screen.refresh()
+        status = send_confirmed(account, message)
+        if status.startswith('SENT.'):
+            draft_path.unlink()
+        text_view(screen, status, 'q return to browser', {'q'})
+        return status
+
+
+def put_line(screen: curses.window, y: int, text: str, attr: int = 0) -> None:
+    """Clip text and tolerate a terminal resize during drawing."""
+    height, width = screen.getmaxyx()
+    if 0 <= y < height and width > 1:
+        try:
+            safe = ''.join(char if char.isprintable() else ' ' for char in text)
+            screen.addnstr(y, 0, safe, width - 1, attr)
+        except curses.error:
+            pass
+
+
+def entry_line(group: list[dict]) -> str:
+    """Show the latest message as the conversation summary."""
+    row = group[0]
+    date = message_date(row)
+    stamp = 'unknown' if date.year == 1 else date.astimezone().strftime('%Y-%m-%d %H:%M')
+    accounts = {item['account'] for item in group}
+    account = clean(row['account']) if len(accounts) == 1 else 'multiple'
+    sender = ', '.join(clean(a.get('name') or a.get('email', '')) for a in row.get('from', []))
+    if row.get('sent'):
+        sender = 'You (sent)'
+    unread = '*' if any(is_unread(item) for item in group) else ' '
+    count = f'[{len(group)}]' if len(group) > 1 else ''
+    return f'{unread} {count:>4} {stamp:16} {account:12.12} {sender:18.18} {clean(row.get("subject") or "(no subject)")}'
+
+
+def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox',
+           threaded: bool = True, in_thread: bool = False, catalog: list[dict] | None = None) -> None:
+    """Browse headers with keys or mouse; Enter opens a thread or its message."""
+    screen.keypad(True)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.mousemask(curses.ALL_MOUSE_EVENTS)
+    if catalog is None:
+        catalog = rows
+    selected = top = 0
+    query = status = ''
+    editing = False
+    view = 'inbox'
+    while True:
+        entries = conversations(rows) if threaded else [[row] for row in rows]
+        if not in_thread and view != 'all':
+            entries = [group for group in entries if any(
+                row.get('in_inbox', True) if view == 'inbox' else row.get('sent', False)
+                for row in group)]
+        filtered = [group for group in entries if not query or any(
+            query.casefold() in ' '.join((clean(row.get('subject', '')), clean(row.get('from', [])),
+                                         clean(row['account']), clean(row['id']))).casefold()
+            for row in group)]
+        height, _ = screen.getmaxyx()
+        page = max(1, height - 5)
+        selected = max(0, min(selected, len(filtered) - 1))
+        top = max(0, min(top, selected, max(0, len(filtered) - page)))
+        if selected >= top + page:
+            top = selected - page + 1
+        screen.erase()
+        mode = 'conversations' if threaded else 'messages'
+        heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
+        put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread', curses.A_BOLD)
+        put_line(screen, 1, 'Arrows/wheel scroll | Enter open | r reply | R reply all | / filter | q back')
+        put_line(screen, 2, 'c compose | d drafts | u refresh | i inbox | s sent | a all mail | t threads' if not in_thread
+                 else 'Select a message to reply to it. Press u to refresh this conversation.')
+        for y, group in enumerate(filtered[top:top + page], 3):
+            put_line(screen, y, entry_line(group), curses.A_REVERSE if y - 3 + top == selected else 0)
+        if not filtered:
+            put_line(screen, 3, 'No matching messages.' if query else 'No messages in this view.')
+        footer = status or (f'Filter: {query}' if editing or query else f'{selected + 1 if filtered else 0}/{len(filtered)}')
+        put_line(screen, height - 1, footer, curses.A_BOLD)
+        screen.refresh()
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
+        if editing:
+            if key in ('\n', '\r', curses.KEY_ENTER):
+                editing = False
+            elif key == '\x1b':
+                query, editing = '', False
+            elif key in ('\b', '\x7f', curses.KEY_BACKSPACE):
+                query = query[:-1]
+            elif isinstance(key, str) and key.isprintable():
+                query += key
+            selected = top = 0
+            continue
+        status = ''
+        if key in ('q', 'Q'):
+            return
+        if key == '/':
+            editing = True
+        elif key == '\x1b':
+            query = ''
+        elif key == 't' and not in_thread:
+            threaded = not threaded
+            selected = top = 0
+        elif key in ('i', 's', 'a') and not in_thread:
+            view = {'i': 'inbox', 's': 'sent', 'a': 'all'}[key]
+            selected = top = 0
+            query = ''
+        elif key == 'u':
+            try:
+                screen.erase()
+                put_line(screen, 0, 'Refreshing folder headers and conversations...')
+                screen.refresh()
+                fresh = load_all()
+                catalog[:] = fresh
+                if in_thread:
+                    ids = {normalized_id(row.get('message-id')) for row in rows} - {''}
+                    fresh = next((group for group in conversations(fresh)
+                                  if any(normalized_id(row.get('message-id')) in ids for row in group)), [])
+                    fresh.sort(key=message_date)
+                rows[:] = fresh
+                status = 'Refreshed.'
+            except RuntimeError:
+                status = 'Refresh failed; keeping the previous view. Private diagnostics suppressed.'
+        elif key in ('r', 'R', 'c', 'd'):
+            try:
+                if key == 'c':
+                    status = compose(screen)
+                elif key == 'd':
+                    paths = sorted(draft_directory().glob('draft-*.txt'), key=lambda p: p.stat().st_mtime, reverse=True)
+                    choice = choose(screen, 'Local drafts (newest first)', [p.name for p in paths])
+                    status = compose(screen, draft_path=paths[choice]) if choice is not None else 'No draft selected.'
+                elif filtered:
+                    group = filtered[selected]
+                    # A conversation summary replies to its latest received mail,
+                    # not accidentally to our own most recent sent copy.
+                    target = next((row for row in group if not row.get('sent')), group[0])
+                    status = compose(screen, target, reply_all=key == 'R')
+            except (RuntimeError, OSError):
+                status = 'Could not prepare the draft; private diagnostics suppressed.'
+        elif key in (curses.KEY_DOWN, 'j'):
+            selected += 1
+        elif key in (curses.KEY_UP, 'k'):
+            selected -= 1
+        elif key in (curses.KEY_NPAGE, ' ', '\x06'):
+            selected += page
+        elif key in (curses.KEY_PPAGE, '\x02'):
+            selected -= page
+        elif key in (curses.KEY_HOME, 'g'):
+            selected = 0
+        elif key in (curses.KEY_END, 'G'):
+            selected = len(filtered) - 1
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, _, y, _, buttons = curses.getmouse()
+            except curses.error:
+                continue
+            if buttons & curses.BUTTON4_PRESSED:
+                selected -= 3
+            elif buttons & getattr(curses, 'BUTTON5_PRESSED', 0):
+                selected += 3
+            elif (buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED)
+                  and 3 <= y < 3 + page and top + y - 3 < len(filtered)):
+                selected = top + y - 3
+                if buttons & curses.BUTTON1_DOUBLE_CLICKED:
+                    key = '\n'
+        if key in ('\n', '\r', curses.KEY_ENTER) and filtered:
+            group = filtered[selected]
+            try:
+                if len(group) > 1:
+                    browse(screen, sorted(group, key=message_date), 'Conversation', False, True, catalog)
+                else:
+                    show_message(screen, group[0])
+            except RuntimeError as error:
+                status = str(error)
+
+
+def render(rows: list[dict]) -> None:
+    """Print full sender/subject text; pipe to `less -S` for horizontal scrolling."""
+    print(f'{"ACCOUNT:ID":<26} {"DATE (local)":16}   {"FROM":<34} SUBJECT')
+    for row in rows:
+        date = message_date(row)
+        date_text = 'unknown' if date.year == 1 else date.astimezone().strftime('%Y-%m-%d %H:%M')
+        unread = '*' if is_unread(row) else ' '
+        senders = ', '.join(
+            f"{address['name']} <{address.get('email', '')}>" if address.get('name')
+            else address.get('email', '')
+            for address in row.get('from', [])
+        )
+        reference = clean(f"{row['account']}:{row['id']}")
+        print(f'{reference:<26} {date_text:16} {unread} {clean(senders):<34} {clean(row.get("subject", ""))}')
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return number
+
+
+def read_settings(path: str | None) -> None:
+    """Read a single Himalaya TOML config locally; never print it or credentials."""
+    global SETTINGS, CONFIG_ARGS
+    path = path or os.environ.get('HIMALAYA_CONFIG') or str(Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'himalaya/config.toml')
+    config_path = Path(os.path.expandvars(path)).expanduser()
+    try:
+        SETTINGS = tomllib.loads(config_path.read_text())['accounts']
+    except (OSError, ValueError, KeyError):
+        raise RuntimeError('Cannot read Himalaya configuration; use --config with a single TOML file.') from None
+    CONFIG_ARGS = ['--config', str(config_path)]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Combine the INBOX folders of all Himalaya accounts, newest first.')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-n', '--limit', type=positive_int, help='plain-list mode: show only the newest N messages in total')
+    group.add_argument('--all', action='store_true', help='fetch every inbox page; may take longer')
+    parser.add_argument('--list', action='store_true', help='print a list instead of opening the browser')
+    parser.add_argument('--flat', action='store_true', help='start with individual messages instead of conversations')
+    parser.add_argument('--config', help='path to a single Himalaya TOML configuration file')
+    parser.epilog = 'Interactive: full conversations across Inbox, Sent and filed mail (excluding Drafts/Trash/Junk). Piped/--list: newest 50 inbox messages unless --all/-n is given.'
+    args = parser.parse_args()
+    interactive = not args.list and sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive:
+        if args.limit is not None:
+            parser.error('-n/--limit applies to --list or piped output; interactive threads load all included folders.')
+        read_settings(args.config)
+        print('Loading Inbox, Sent and filed-mail headers, including conversation history...', file=sys.stderr, flush=True)
+        rows = load_all()
+        curses.wrapper(browse, rows, 'Unified inbox', not args.flat)
+        return
+    if args.config:
+        read_settings(args.config)
+    limit = args.limit if args.limit is not None else (None if args.all or interactive else 50)
+    accounts = [item['name'] for item in run_himalaya(['account', 'list'])['accounts']]
+    if not accounts:
+        raise RuntimeError('No Himalaya accounts configured.')
+    print(f'Loading inbox headers from {len(accounts)} accounts...', file=sys.stderr, flush=True)
+    with ThreadPoolExecutor(max_workers=min(len(accounts), 5)) as pool:
+        batches = list(pool.map(lambda account: fetch(account, limit), accounts))
+    rows = merge(batches, limit)
+    render(rows)
+    qualifier = 'All fetched' if args.all else 'Newest'
+    print(f'{qualifier}: {len(rows)} inbox messages across {len(accounts)} accounts. * = unread.', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
+    except RuntimeError as error:
+        print(f'Unified inbox unavailable: {clean(error)}', file=sys.stderr)
+        sys.exit(1)
+    except (KeyError, TypeError, curses.error):
+        print('Unified inbox unavailable: unexpected data or unsupported terminal; try --list.', file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
