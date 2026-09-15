@@ -1,13 +1,16 @@
 """Exercise the real curses terminal and message reader with synthetic mail only."""
 
 import curses
+from email.message import EmailMessage
 import fcntl
 import os
+from pathlib import Path
 import pty
 import select
 import signal
 import struct
 import sys
+import tempfile
 import termios
 import time
 
@@ -25,10 +28,23 @@ def child() -> None:
         assert '--seen' not in args
         account = args[args.index('--account') + 1]
         body = '\n'.join(f'SYNTHETIC_BODY_{account}_{args[-1]}_LINE_{i:03d}' for i in range(90))
-        return {'message': f'Subject: Synthetic test\nContent-Type: text/plain\n\n{body}'}
+        message = EmailMessage()
+        message['Subject'] = 'Synthetic test'
+        message.set_content(body)
+        message.add_attachment(b'SYNTHETIC_ATTACHMENT', maintype='application', subtype='pdf', filename='terminal file.pdf')
+        return {'message': message.as_string()}
 
     inbox.run_himalaya = fake_read
-    curses.wrapper(inbox.browse, rows)
+    with tempfile.TemporaryDirectory() as directory:
+        inbox.download_directory = lambda: Path(directory)
+
+        def mock_viewer(path):
+            assert path.read_bytes() == b'SYNTHETIC_ATTACHMENT'
+            return 'SYNTHETIC_VIEWER'
+
+        inbox.open_attachment = mock_viewer
+        curses.wrapper(inbox.browse, rows)
+        assert len(list(Path(directory).iterdir())) == 1
 
 
 pid, master = pty.fork()
@@ -58,6 +74,17 @@ def expect(marker: bytes, timeout: float = 6) -> None:
 try:
     expect(b'SYNTHETIC_SINGLE')
     os.write(master, b'\r')
+    expect(b'SYNTHETIC_BODY_test_1_LINE_000')
+    os.write(master, b'a')
+    expect(b'ATTACHMENTS')
+    os.write(master, b'\r')
+    # Curses retains the unchanged ATTACHMENT prefix from the previous screen.
+    expect(b'o open')
+    os.write(master, b's')
+    expect(b'Saved:')
+    os.write(master, b'o')
+    expect(b'SYNTHETIC_VIEWER')
+    os.write(master, b'qq')
     expect(b'SYNTHETIC_BODY_test_1_LINE_000')
     # Search and scrolling happen inside the actual message reader.
     os.write(master, b'/LINE_070\r')

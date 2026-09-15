@@ -10,7 +10,9 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Groups conversations using `Message-ID`, `In-Reply-To`, and the full `References` ancestry, not subject matching.
 - Includes your own sent replies and archived/filed messages in threads, oldest first.
 - Reads plain text or extracts text from HTML without loading remote images or scripts.
+- Lists attachments and inline images; saves or opens selected files with your desktop application.
 - Replies, replies to all, and composes new mail in Neovim.
+- Attaches local files to new messages and replies, with a file picker and removable attachments.
 - Suggests recipients automatically by name or address in Neovim's To/Cc fields.
 - Shows the message for review and queues it with a cancellable five-minute delay by default.
 - Offers a custom delay or an explicit send-now confirmation.
@@ -23,6 +25,7 @@ The inbox is still the starting view: a thread appears there if it contains an I
 - Himalaya **2.1.x**, already configured with working incoming and outgoing authentication.
 - IMAP accounts. Other Himalaya backends are not currently supported by full-conversation browsing.
 - Linux/Unix terminal, Python 3.12+ with curses, [uv](https://docs.astral.sh/uv/), and Neovim 0.11+.
+- Optional Linux desktop tools: `gio` (GLib) for opening downloaded files, and `xdg-user-dir` for finding your configured Downloads folder. Saving works without these tools.
 
 ```sh
 git clone https://github.com/alessionegro99/himalaya-inbox.git
@@ -49,6 +52,8 @@ Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own
 | `d` | Resume a local draft |
 | `o` | Outbox: see countdowns and press `x` to cancel pending mail |
 | `i` / `s` / `a` | Inbox / Sent / all indexed mail |
+| `a` inside an open message | Browse attachments; Enter selects a file, then `o` opens or `s` saves it |
+| `a` / `x` on the compose review screen | Attach a file / remove an attachment |
 | `t` | Toggle conversation grouping |
 | `/` | Filter the list or search an open message |
 | Escape | Clear the list filter |
@@ -86,6 +91,23 @@ In **To** or **Cc**, type at least two characters of a name or email address. A 
 No suggestion is selected automatically. Only the email address is inserted, and autocomplete stays out of Subject and body text. Check the complete recipient addresses in the review screen: display names from received mail are not verified identities.
 
 Finish editing with `Esc`, then `:wq` and Enter. Review and queue/send as described above; saving in Neovim never sends mail.
+
+### Attachments
+
+**Received files:** open a message and press `a`. Choose an attachment with the arrows or mouse and press Enter. Press `s` to save it to your desktop Downloads folder, or `o` to save and open it with the default application. Press `q` to go back. Inline images are included; attached emails are saved as `.eml` files without separately extracting their internal attachments.
+
+The saved path appears at the bottom. Existing files are never overwritten: a duplicate gets a numbered name such as `report (1).pdf`. Downloaded files have permissions 600 and no executable bit. Filenames are stripped of directory components and unsafe display characters. Opening is an explicit action, never automatic; known executable/launcher extensions are save-only. External viewers are not sandboxed and may access the network, so only open files you trust. The fallback download location is `~/Downloads` if `xdg-user-dir` is unavailable.
+
+**Sending files:** compose with `c`, or reply with `r`/`R`, then save and exit Neovim using `:wq`. On the review screen press `a`. Browse to a file with arrows and Enter, or select the first entry to type/paste a path. Choose directories to enter them and `../` to go up; hidden files can be selected by typing their full path. Repeat `a` for more files. Press `x` to choose an attachment to remove. The review shows the attachment count and filenames; adding/removing files does not send the message.
+
+You can also fill in the `Attach:` header directly in Neovim, above the blank line separating headers from the message body:
+
+```text
+Attach: ~/Documents/report.pdf
+Attach: ~/Pictures/figure with spaces.png
+```
+
+Use one absolute path (or `~/...`) per header, without shell quotes or escaping. Neovim's built-in `Ctrl-X Ctrl-F` completes file paths. These headers stay local; recipients receive only attachment basenames and contents, never your local paths. A saved draft remembers file paths, not copies: files must still exist when you resume it. Files are read when the message is built for review; the confirmed outgoing message contains its own copy. Incoming attachments are **not** automatically included in replies. The combined attachment file-size limit is 20 MiB before MIME encoding; your mail server may impose a smaller limit.
 
 ### Enable delayed sending (Linux/systemd)
 
@@ -145,11 +167,11 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts, bounded caches, concurrent folder loading, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending is mocked; no real messages are sent.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts, bounded caches, concurrent folder loading, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending and attachment viewers are mocked; no real messages are sent.
 
 ## Scope and upstream credit
 
-This is a small personal interface, not a full replacement for Thunderbird. Attachments are listed but not opened or composed; encryption/signing, remote draft synchronization, server-side deletion, and persistent/offline mail indexing are not implemented. Only one configuration file is supported.
+This is a small personal interface, not a full replacement for Thunderbird. Encryption/signing, remote draft synchronization, server-side deletion, and persistent/offline mail indexing are not implemented. Only one configuration file is supported.
 
 The transport/backend work is provided by [Pimalaya's Himalaya](https://github.com/pimalaya/himalaya). Thread identifiers follow [RFC 5322 §3.6.4](https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4); header-only fetching follows [IMAP RFC 3501](https://www.rfc-editor.org/rfc/rfc3501). Python's standard-library `email` and `curses` modules provide MIME handling and the terminal interface.
 

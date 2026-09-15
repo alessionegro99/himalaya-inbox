@@ -21,15 +21,17 @@ from email import policy
 from email.errors import HeaderParseError
 from email.headerregistry import Address
 from email.message import EmailMessage
-from email.parser import Parser
+from email.parser import BytesParser, Parser
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid
 from html.parser import HTMLParser
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,7 @@ CONFIG_ARGS: list[str] = []
 CONTACTS: list[dict[str, str]] = []
 REFERENCE_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
 MESSAGE_CACHE: OrderedDict[tuple[str, str, str], str] = OrderedDict()
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 
 def run_private(args: list[str], data: bytes | None = None) -> bytes:
@@ -381,9 +384,142 @@ class HtmlText(HTMLParser):
             self.parts.append(' '.join(data.split()) + ' ')
 
 
+def attachment_parts(message: EmailMessage) -> list[EmailMessage]:
+    """Find files, including inline images, without descending into attached mail.
+
+    MIME tree semantics: https://docs.python.org/3.12/library/email.message.html
+    """
+    parts = []
+    pending = [message]
+    while pending:
+        part = pending.pop()
+        inline_file = (part.get_content_disposition() == 'inline' or part.get('Content-ID')) and part.get_content_maintype() != 'text'
+        if (part.get_content_disposition() == 'attachment' or part.get_filename()
+                or part.get_content_type() == 'message/rfc822' or (inline_file and not part.is_multipart())):
+            parts.append(part)
+        elif part.is_multipart():
+            pending.extend(reversed(part.get_payload()))
+    return parts
+
+
+def attachment_name(part: EmailMessage) -> str:
+    """Keep untrusted filenames inside Downloads, visible, and below NAME_MAX."""
+    fallback = 'attachment' + (mimetypes.guess_extension(part.get_content_type()) or '.bin')
+    name = str(part.get_filename() or fallback).replace('\\', '/').rsplit('/', 1)[-1]
+    name = ''.join(char if char.isprintable() else '_' for char in name).strip().lstrip('.-') or fallback
+    suffix = Path(name).suffix
+    if len(suffix.encode('utf-8')) > 32:
+        suffix = ''
+    stem = name[:-len(suffix)] if suffix else name
+    return stem.encode('utf-8')[:180].decode('utf-8', 'ignore') + suffix
+
+
+def attachment_bytes(part: EmailMessage) -> bytes:
+    """Decode transfer encoding; serialize attached messages with their headers."""
+    try:
+        if part.get_content_type() == 'message/rfc822' and part.is_multipart():
+            return part.get_payload(0).as_bytes(policy=policy.SMTP)
+        if part.is_multipart():
+            return part.as_bytes(policy=policy.SMTP)
+        data = part.get_payload(decode=True)
+        if not isinstance(data, bytes) or part.defects:
+            raise ValueError('Missing payload')
+        return data
+    except Exception:
+        raise RuntimeError('This attachment could not be decoded; private diagnostics suppressed.') from None
+
+
+def download_directory() -> Path:
+    """Use the desktop Downloads folder without evaluating shell configuration."""
+    try:
+        result = subprocess.run(['xdg-user-dir', 'DOWNLOAD'], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, timeout=3, check=True)
+        path = Path(result.stdout.decode('utf-8').strip())
+        if path.is_absolute():
+            return path
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return Path.home() / 'Downloads'
+
+
+def save_attachment(part: EmailMessage, directory: Path) -> Path:
+    """Write a private file; exclusive creation prevents overwrites and symlinks.
+
+    https://docs.python.org/3.12/library/os.html#os.open
+    """
+    data = attachment_bytes(part)
+    directory = directory.expanduser().absolute()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    name = attachment_name(part)
+    suffix = Path(name).suffix
+    stem = name[:-len(suffix)] if suffix else name
+    for number in range(1000):
+        path = directory / (name if number == 0 else f'{stem} ({number}){suffix}')
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(descriptor, 'wb') as file:
+                file.write(data)
+        except BaseException:
+            path.unlink()
+            raise
+        return path
+    raise RuntimeError('Too many matching filenames in the download folder.')
+
+
+def open_attachment(path: Path) -> str:
+    """Ask the desktop to open an explicitly selected file, never a shell command."""
+    # GIO launches the associated app without waiting for the viewer to close.
+    # See `gio help open`; file paths are absolute arguments, never shell text.
+    if path.suffix.casefold() in {'.desktop', '.exe', '.com', '.msi', '.bat', '.cmd', '.sh', '.appimage'}:
+        return 'Saved, but executable/launcher attachments are not opened by this client.'
+    try:
+        result = subprocess.run(['gio', 'open', str(path.absolute())], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if result.returncode == 0:
+            return 'Opened with the desktop application.'
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return 'Could not launch a viewer. Open the saved file from your file manager.'
+
+
+def show_attachments(screen: curses.window, raw: str) -> str:
+    """Select incoming attachments, then explicitly save or open each one."""
+    try:
+        parts = attachment_parts(BytesParser(policy=policy.default).parsebytes(raw.encode('utf-8')))
+        if not parts:
+            return 'This message has no attachments.'
+        saved: dict[int, Path] = {}
+        status = ''
+        while True:
+            index = choose(screen, 'ATTACHMENTS',
+                           [f'{attachment_name(part)}  [{clean(part.get_content_type())}]' for part in parts])
+            if index is None:
+                return status
+            part = parts[index]
+            details = (f'{attachment_name(part)}\nType: {clean(part.get_content_type())}\n'
+                       f'Size: {len(attachment_bytes(part)):,} bytes\n\n'
+                       'Open only files you trust. External viewers may access the network.\n'
+                       'Opening also saves a copy in your Downloads folder.')
+            while True:
+                choice = text_view(screen, details, 'ATTACHMENT | o open | s save | q back', {'o', 's', 'q'}, status)
+                if choice == 'q':
+                    break
+                if index not in saved:
+                    saved[index] = save_attachment(part, download_directory())
+                path = saved[index]
+                status = f'Saved: {path}'
+                if choice == 'o':
+                    status = open_attachment(path) + f' Saved: {path}'
+    except Exception:
+        return 'Attachment operation failed; private diagnostics suppressed. Check your Downloads folder.'
+
+
 def message_text(raw: str, row: dict) -> str:
     """Decode MIME, prefer plain text, and remove terminal control characters."""
-    message = Parser(policy=policy.default).parsestr(raw)
+    message = BytesParser(policy=policy.default).parsebytes(raw.encode('utf-8'))
     lines = [f"Account: {clean(row['account'])}   Folder: {clean(row.get('mailbox', 'inbox'))}   ID: {clean(row['id'])}"]
     for header in ('Date', 'From', 'To', 'Cc', 'Subject'):
         if message.get(header):
@@ -399,11 +535,9 @@ def message_text(raw: str, row: dict) -> str:
             parser.feed(content)
             content = '\n'.join(line.strip() for line in ''.join(parser.parts).splitlines() if line.strip())
         lines.append(content)
-    attachments = [clean(part.get_filename() or part.get_content_type())
-                   for part in message.walk()
-                   if part.get_content_disposition() == 'attachment' or part.get_filename()]
+    attachments = [attachment_name(part) for part in attachment_parts(message)]
     if attachments:
-        lines.extend(['', 'Attachments (not opened):', *attachments])
+        lines.extend(['', 'Attachments:', *attachments])
     text = '\n'.join(lines).replace('\r\n', '\n').replace('\r', '\n')
     return ''.join(char for char in text if char.isprintable() or char in '\n\t') + '\n'
 
@@ -447,13 +581,17 @@ def show_message(screen: curses.window, row: dict) -> None:
     screen.erase()
     put_line(screen, 0, 'Opening message (read-only)...')
     screen.refresh()
-    text = read_message(row)
+    raw = read_raw(row)
+    try:
+        text = message_text(raw, row)
+    except Exception:
+        raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
     status = ''
     while True:
-        key = text_view(screen, text, 'r reply | R reply all | / search | q back', {'r', 'R', 'q'}, status)
+        key = text_view(screen, text, 'r reply | R reply all | a attachments | / search | q back', {'r', 'R', 'a', 'q'}, status)
         if key == 'q':
             return
-        status = compose(screen, row, reply_all=key == 'R')
+        status = show_attachments(screen, raw) if key == 'a' else compose(screen, row, reply_all=key == 'R')
 
 
 @contextmanager
@@ -541,7 +679,7 @@ def text_view(screen: curses.window, text: str, help_text: str,
 
 
 def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
-    """Select an account or saved draft without entering a shell command."""
+    """Select a list item without entering a shell command."""
     index = 0
     while choices:
         screen.erase()
@@ -550,6 +688,7 @@ def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
         top = max(0, index - page + 1)
         for y, item in enumerate(choices[top:top + page], 1):
             put_line(screen, y, item, curses.A_REVERSE if top + y - 1 == index else 0)
+        put_line(screen, screen.getmaxyx()[0] - 1, 'Enter select | q cancel | arrows/wheel scroll')
         screen.refresh()
         key = screen.get_wch()
         if key in ('q', '\x1b'):
@@ -560,7 +699,106 @@ def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
             index = min(len(choices) - 1, index + 1)
         elif key in ('k', curses.KEY_UP):
             index = max(0, index - 1)
+        elif key in (curses.KEY_NPAGE, ' '):
+            index = min(len(choices) - 1, index + page)
+        elif key == curses.KEY_PPAGE:
+            index = max(0, index - page)
+        elif key in ('g', curses.KEY_HOME):
+            index = 0
+        elif key in ('G', curses.KEY_END):
+            index = len(choices) - 1
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, _, y, _, buttons = curses.getmouse()
+                if buttons & curses.BUTTON4_PRESSED:
+                    index = max(0, index - 3)
+                elif buttons & getattr(curses, 'BUTTON5_PRESSED', 0):
+                    index = min(len(choices) - 1, index + 3)
+                elif buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED):
+                    if 1 <= y <= page and top + y - 1 < len(choices):
+                        index = top + y - 1
+                        if buttons & curses.BUTTON1_DOUBLE_CLICKED:
+                            return index
+            except curses.error:
+                pass
     return None
+
+
+def choose_file(screen: curses.window) -> Path | None:
+    """Browse files or paste a path; hidden files remain available by exact path."""
+    directory = Path.home()
+    while True:
+        try:
+            entries = sorted((path for path in directory.iterdir() if not path.name.startswith('.')),
+                             key=lambda path: (not path.is_dir(), path.name.casefold()))
+        except OSError:
+            text_view(screen, 'Cannot list this folder.', 'q back', {'q'})
+            directory = directory.parent
+            continue
+        options = ['[Type/paste a file or folder path]', '../']
+        options.extend(clean(path.name) + ('/' if path.is_dir() else '') for path in entries)
+        index = choose(screen, f'ATTACH FILE: {directory}', options)
+        if index is None:
+            return None
+        if index == 0:
+            value = input_line(screen, 'File/folder path (Escape cancels): ')
+            if not value:
+                continue
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                path = directory / path
+        else:
+            path = directory.parent if index == 1 else entries[index - 2]
+        if path.is_dir():
+            directory = path
+        else:
+            return path.absolute()
+
+
+def draft_attachments(draft: str) -> list[str]:
+    """Read only explicit local Attach headers, never paths from the mail body."""
+    parsed = Parser(policy=policy.default).parsestr(draft)
+    return [str(value).strip() for value in parsed.get_all('Attach', []) if str(value).strip()]
+
+
+def change_attachments(screen: curses.window, draft: str, remove: bool = False) -> str | None:
+    """Modify local-only attachment headers; the caller validates before saving."""
+    paths = draft_attachments(draft)
+    if remove:
+        if not paths:
+            return None
+        index = choose(screen, 'REMOVE ATTACHMENT', [clean(path) for path in paths])
+        if index is None:
+            return None
+        paths.pop(index)
+    else:
+        path = choose_file(screen)
+        if path is None:
+            return None
+        value = str(path)
+        if value != value.strip() or not value.isprintable():
+            raise RuntimeError('Attachment paths must be printable, without trailing whitespace.')
+        if value in paths:
+            return None
+        paths.append(value)
+    parsed = Parser(policy=policy.default).parsestr(draft)
+    del parsed['Attach']
+    for value in paths:
+        parsed['Attach'] = value
+    # Drafts are UTF-8 text, not transport MIME. Never fold paths across lines.
+    return parsed.as_string(policy=policy.default.clone(utf8=True, max_line_length=0))
+
+
+def save_draft(path: Path, text: str) -> None:
+    """Replace only a successfully validated draft, with private permissions."""
+    descriptor, name = tempfile.mkstemp(prefix='.attachment-edit-', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as file:
+            file.write(text)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def draft_directory() -> Path:
@@ -646,7 +884,10 @@ def process_outbox() -> None:
         note = 'Configuration changed or is unavailable; nothing was sent.'
         try:
             read_settings(item['config'])
-            message = Parser(policy=policy.default).parsestr(item['payload'].decode('utf-8'))
+            # Keep MIME as bytes: decoding 8-bit UTF-8 body text before parsing
+            # loses the byte-preserving representation needed by as_bytes().
+            # https://docs.python.org/3.12/library/email.parser.html
+            message = BytesParser(policy=policy.SMTP).parsebytes(item['payload'])
             configured = SETTINGS[item['account']]['email'].casefold()
             actual = {a.casefold() for _, a in getaddresses(message.get_all('From', []))}
             if actual != {configured}:
@@ -695,7 +936,7 @@ def outbox_view(screen: curses.window) -> None:
                 state = f'queued {remaining // 60}:{remaining % 60:02d}' if item['status'] == 'pending' else item['status']
                 subject = '(local queued body removed)'
                 if item['payload']:
-                    headers = Parser(policy=policy.default).parsestr(item['payload'].decode('utf-8'), headersonly=True)
+                    headers = BytesParser(policy=policy.default).parsebytes(item['payload'], headersonly=True)
                     subject = clean(headers.get('Subject', '(no subject)'))
                 put_line(screen, y, f"{state:<18} {item['account']:<12} {subject}", curses.A_REVERSE if top + y - 1 == selected else 0)
             if not items:
@@ -754,7 +995,7 @@ def reply_template(raw: str, account: str, reply_all: bool = False) -> str:
     refs = message_ids(source.get('References')) or message_ids(source.get('In-Reply-To'))
     refs = list(dict.fromkeys([*refs, *parent]))
     quoted = message_text(raw, {'account': account, 'id': ''}).split('\n\n', 1)[-1]
-    headers = [f'X-Himalaya-Account: {account}', f'To: {to}', f'Cc: {cc}', f'Subject: {subject}']
+    headers = [f'X-Himalaya-Account: {account}', f'To: {to}', f'Cc: {cc}', f'Subject: {subject}', 'Attach: ']
     if parent:
         headers.append('In-Reply-To: ' + ' '.join(f'<{v}>' for v in parent))
     if refs:
@@ -765,10 +1006,10 @@ def reply_template(raw: str, account: str, reply_all: bool = False) -> str:
 def build_message(draft: str) -> tuple[str, EmailMessage]:
     """Validate editable fields and construct the exact message to confirm/send."""
     parsed = Parser(policy=policy.default).parsestr(draft)
-    allowed = {'x-himalaya-account', 'to', 'cc', 'subject', 'in-reply-to', 'references'}
+    allowed = {'x-himalaya-account', 'to', 'cc', 'subject', 'in-reply-to', 'references', 'attach'}
     if any(key.lower() not in allowed for key in parsed.keys()) or parsed.defects:
-        raise RuntimeError('Draft has unsupported headers; keep Account, To, Cc, Subject and reply identifiers only.')
-    if any(len(parsed.get_all(key, [])) > 1 for key in allowed):
+        raise RuntimeError('Draft has unsupported headers; keep Account, To, Cc, Subject, Attach and reply identifiers only.')
+    if any(len(parsed.get_all(key, [])) > 1 for key in allowed - {'attach'}):
         raise RuntimeError('Draft has duplicate headers.')
     account = str(parsed.get('X-Himalaya-Account', '')).strip()
     if account not in SETTINGS:
@@ -792,9 +1033,37 @@ def build_message(draft: str) -> tuple[str, EmailMessage]:
     message['Date'] = format_datetime(datetime.now().astimezone())
     message['Message-ID'] = make_msgid(domain=identity['email'].rsplit('@', 1)[-1])
     body = parsed.get_payload()
-    if not isinstance(body, str) or not body.strip():
-        raise RuntimeError('The reply body is empty.')
+    if not isinstance(body, str) or (not body.strip() and not draft_attachments(draft)):
+        raise RuntimeError('The message is empty; add body text or an attachment.')
     message.set_content(body, charset='utf-8')
+    total = 0
+    for value in draft_attachments(draft):
+        if not value.isprintable():
+            raise RuntimeError('Attachment paths must be printable and on a single line.')
+        try:
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                raise RuntimeError('Use an absolute path or ~/path in each Attach header.')
+            # O_NONBLOCK avoids hanging on FIFOs; fstat rejects devices/directories.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                os.close(descriptor)
+                raise RuntimeError('Only regular files can be attached.')
+            with os.fdopen(descriptor, 'rb') as file:
+                data = file.read(MAX_ATTACHMENT_BYTES - total + 1)
+        except (OSError, ValueError):
+            raise RuntimeError(f'Cannot read attachment {clean(value)}; fix or remove its Attach header.') from None
+        total += len(data)
+        if total > MAX_ATTACHMENT_BYTES:
+            raise RuntimeError('Attachments exceed the 20 MiB combined file-size limit.')
+        content_type, encoding = mimetypes.guess_type(path.name)
+        if not content_type or encoding or content_type.startswith(('message/', 'multipart/')):
+            content_type = 'application/octet-stream'
+        maintype, subtype = content_type.split('/', 1)
+        # Base64 preserves arbitrary bytes. Only basenames leave the laptop;
+        # local Attach headers are deliberately absent from the outgoing MIME.
+        # https://docs.python.org/3.12/library/email.message.html#email.message.EmailMessage.add_attachment
+        message.add_attachment(data, maintype=maintype, subtype=subtype, filename=path.name, cte='base64')
     return account, message
 
 
@@ -929,7 +1198,7 @@ def compose(screen: curses.window, row: dict | None = None, reply_all: bool = Fa
             index = choose(screen, 'Send from account', accounts)
             if index is None:
                 return 'Compose cancelled.'
-            template = f'X-Himalaya-Account: {accounts[index]}\nTo: \nCc: \nSubject: \n\n'
+            template = f'X-Himalaya-Account: {accounts[index]}\nTo: \nCc: \nSubject: \nAttach: \n\n'
         descriptor, name = tempfile.mkstemp(prefix='draft-', suffix='.txt', dir=draft_directory())
         draft_path = Path(name)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as file:
@@ -956,10 +1225,26 @@ def compose(screen: curses.window, row: dict | None = None, reply_all: bool = Fa
             if choice == 'e':
                 continue
             return 'Draft kept. Press d to resume.'
-        preview = message_text(message.as_string(), {'account': account, 'id': 'new draft'})
         delay = 5
+        attachment_status = ''
         while True:
-            choice = text_view(screen, preview, f'REVIEW | s queue {delay}m | t delay | N send NOW | e edit | q draft', {'s', 't', 'N', 'e', 'q'})
+            preview = message_text(message.as_string(), {'account': account, 'id': 'new draft'})
+            count = len(attachment_parts(message))
+            choice = text_view(screen, preview, f'REVIEW | a attach({count}) x remove | s queue{delay}m t delay N now | e edit q draft',
+                               {'a', 'x', 's', 't', 'N', 'e', 'q'}, attachment_status)
+            if choice in ('a', 'x'):
+                try:
+                    draft = change_attachments(screen, draft_path.read_text(encoding='utf-8'), remove=choice == 'x')
+                    if draft is None:
+                        attachment_status = 'Attachments unchanged.'
+                    else:
+                        new_account, new_message = build_message(draft)
+                        save_draft(draft_path, draft)
+                        account, message = new_account, new_message
+                        attachment_status = 'Attachment removed.' if choice == 'x' else 'File attached; check the attachment list below.'
+                except (RuntimeError, OSError, ValueError) as error:
+                    attachment_status = str(error) if isinstance(error, RuntimeError) else 'Could not update attachments; draft unchanged.'
+                continue
             if choice != 't':
                 break
             value = input_line(screen, 'Delay in minutes (1-1440, blank = 5): ')

@@ -21,8 +21,12 @@ from test_reply import CONFIG, SOURCE
 @unittest.skipUnless(shutil.which('nvim'), 'Neovim is not installed')
 class EditorIntegrationTests(unittest.TestCase):
     def test_actual_editor_cancel_and_confirmed_mock_send(self) -> None:
-        for send in (False, True):
-            with self.subTest(send=send), tempfile.TemporaryDirectory() as directory:
+        cases = [(False, False, False), (True, False, False), (False, True, False),
+                 (True, True, False), (True, True, True)]
+        for send, attach, new in cases:
+            with self.subTest(send=send, attach=attach, new=new), tempfile.TemporaryDirectory() as directory:
+                attachment_path = Path(directory) / 'synthetic file with spaces.bin'
+                attachment_path.write_bytes(bytes(range(256)))
                 pid, master = pty.fork()
                 if pid == 0:
                     try:
@@ -34,13 +38,17 @@ class EditorIntegrationTests(unittest.TestCase):
 
                         def mock_send(account, message):
                             assert account == 'work'
-                            assert 'Synthetic editor reply' in message.get_content()
+                            assert 'Synthetic editor reply' in message.get_body().get_content()
                             assert str(message['To']) == 'reply@example.net'
+                            files = inbox.attachment_parts(message)
+                            assert len(files) == int(attach)
+                            if attach:
+                                assert inbox.attachment_bytes(files[0]) == bytes(range(256))
                             sent.append(message)
                             return 'SENT. Synthetic transport only.'
 
                         inbox.send_confirmed = mock_send
-                        curses.wrapper(inbox.compose, row('work', '1', 'one'))
+                        curses.wrapper(inbox.compose, None if new else row('work', '1', 'one'))
                         assert bool(sent) == send
                         os.write(1, b'EDITOR_TEST_FINISHED\n')
                         os._exit(0)
@@ -60,9 +68,21 @@ class EditorIntegrationTests(unittest.TestCase):
                     buffer.clear()
 
                 try:
+                    if new:
+                        expect(b'Send from account')
+                        os.write(master, b'\r')
                     expect(b'X-Himalaya-Account')
+                    if new:
+                        os.write(master, b'gg/^To:\rAreply@example.net\x1b')
                     os.write(master, b'GoSynthetic editor reply\x1b:wq\r')
                     expect(b'REVIEW')
+                    if attach:
+                        os.write(master, b'a')
+                        expect(b'ATTACH FILE')
+                        os.write(master, b'\r')
+                        expect(b'File/folder path')
+                        os.write(master, str(attachment_path).encode() + b'\r')
+                        expect(b'File attached')
                     if send:
                         os.write(master, b'N')
                         expect(b'Type SEND NOW')
@@ -74,6 +94,8 @@ class EditorIntegrationTests(unittest.TestCase):
                     self.assertEqual(os.waitstatus_to_exitcode(status), 0)
                     paths = list(Path(directory).glob('draft-*.txt'))
                     self.assertEqual(len(paths), 0 if send else 1)
+                    if paths:
+                        self.assertEqual(inbox.draft_attachments(paths[0].read_text()), [str(attachment_path)] if attach else [])
                 except BaseException:
                     try:
                         os.kill(pid, signal.SIGTERM)
