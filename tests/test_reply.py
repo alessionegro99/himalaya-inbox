@@ -171,6 +171,7 @@ class ReplyTests(unittest.TestCase):
                         patch.object(inbox, 'send_confirmed', return_value='SENT. Test') as send:
                     inbox.compose(FakeScreen([]), row('work', '1', 'one'))
                 self.assertEqual(send.call_count, int(sent))
+                self.assertEqual(editor.call_args.args[0][0], '/synthetic/nvim')
                 self.assertIn('nomodeline', editor.call_args.args[0][7])
                 paths = list(Path(directory).glob('*.txt'))
                 self.assertEqual(len(paths), 0 if sent else 1)

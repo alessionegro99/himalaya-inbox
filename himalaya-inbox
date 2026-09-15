@@ -18,6 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 import curses
 from datetime import datetime, timezone
 from email import policy
+from email.errors import HeaderParseError
+from email.headerregistry import Address
 from email.message import EmailMessage
 from email.parser import Parser
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid
@@ -36,12 +38,16 @@ import tomllib
 import time
 import uuid
 from contextlib import contextmanager
+from collections import OrderedDict
 from collections.abc import Iterator
 
 
 HIMALAYA = os.environ.get('HIMALAYA_BIN') or shutil.which('himalaya') or str(Path.home() / '.local/bin/himalaya')
 SETTINGS: dict = {}
 CONFIG_ARGS: list[str] = []
+CONTACTS: list[dict[str, str]] = []
+REFERENCE_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
+MESSAGE_CACHE: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
 
 def run_private(args: list[str], data: bytes | None = None) -> bytes:
@@ -153,6 +159,14 @@ def parse_reference_fetch(output: bytes) -> dict[str, list[str]]:
 
 def add_references(account: str, mailbox: str, rows: list[dict]) -> None:
     """Fetch all ancestry headers in batches with EXAMINE and BODY.PEEK."""
+    missing = []
+    for row in rows:
+        key = (account, normalized_id(row.get('message-id')))
+        if key in REFERENCE_CACHE:
+            row['references'] = list(REFERENCE_CACHE[key])
+        else:
+            missing.append(row)
+    rows = missing
     for start in range(0, len(rows), 250):
         batch = rows[start:start + 250]
         if any(not str(row['id']).isdigit() for row in batch):
@@ -180,7 +194,7 @@ def load_account(account: str) -> list[dict]:
     boxes = run_himalaya(['--account', account, 'imap', 'list', '--all'])['mailboxes']
     excluded = {aliases.get(role, '').casefold() for role in ('drafts', 'trash', 'junk', 'spam')}
     excluded |= {'drafts', 'trash', 'junk', 'spam', 'deleted', 'deleted items', 'cestino', 'bozze'}
-    all_rows = []
+    selected = []
     for box in boxes:
         mailbox = box['name']
         attrs = {a.casefold().lstrip('\\') for a in box['attributes']}
@@ -192,6 +206,11 @@ def load_account(account: str) -> list[dict]:
                           for value in excluded)
         if is_excluded or leaf in excluded or mailbox in ('[Gmail]', '[Google Mail]'):
             continue
+        selected.append(box)
+
+    def load_box(box: dict) -> list[dict]:
+        mailbox = box['name']
+        attrs = {a.casefold().lstrip('\\') for a in box['attributes']}
         try:
             rows = fetch(account, None, mailbox)
             add_references(account, mailbox, rows)
@@ -200,8 +219,12 @@ def load_account(account: str) -> list[dict]:
         for row in rows:
             row['in_inbox'] = mailbox.casefold() == aliases.get('inbox', 'INBOX').casefold()
             row['sent'] = mailbox == aliases.get('sent') or 'sent' in attrs
-        all_rows.extend(rows)
-    return all_rows
+        return rows
+
+    # Profiling showed network round trips, not grouping, dominate loading.
+    # Bound concurrency per account to avoid excessive IMAP connections.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return [row for batch in pool.map(load_box, selected) for row in batch]
 
 
 def deduplicate(rows: list[dict]) -> list[dict]:
@@ -219,8 +242,51 @@ def deduplicate(rows: list[dict]) -> list[dict]:
 
 def load_all() -> list[dict]:
     """Load accounts in parallel; fail visibly instead of hiding incomplete threads."""
+    global CONTACTS, REFERENCE_CACHE
     with ThreadPoolExecutor(max_workers=min(len(SETTINGS), 5)) as pool:
-        return deduplicate([row for batch in pool.map(load_account, SETTINGS) for row in batch])
+        rows = deduplicate([row for batch in pool.map(load_account, SETTINGS) for row in batch])
+    CONTACTS = collect_contacts(rows)
+    # A Message-ID identifies an immutable message (the same identity used by
+    # deduplicate). Scope by account, never reuse a bare mailbox UID after reset.
+    # https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4
+    REFERENCE_CACHE = {
+        (row['account'], normalized_id(row.get('message-id'))): tuple(row['references'])
+        for row in rows if normalized_id(row.get('message-id')) and 'references' in row
+    }
+    # Refresh revalidates folders and flags; body UIDs must be revalidated too.
+    MESSAGE_CACHE.clear()
+    return rows
+
+
+def collect_contacts(rows: list[dict]) -> list[dict[str, str]]:
+    """Collect only public address headers already loaded; never bodies or Bcc.
+
+    Most recent nonempty display names win. Address parses use the same standard
+    library as draft validation, rather than guessing valid addresses with regex.
+    https://docs.python.org/3/library/email.headerregistry.html#email.headerregistry.Address
+    """
+    contacts = {}
+    for row in sorted(rows, key=message_date, reverse=True):
+        for field in ('from', 'to'):
+            for value in row.get(field) or []:
+                address = value.get('email')
+                if not isinstance(address, str) or not address or not all(c.isprintable() for c in address):
+                    continue
+                try:
+                    parsed = Address(addr_spec=address)
+                except (ValueError, HeaderParseError, IndexError, AttributeError):
+                    # Malformed input can also hit bugs in the stdlib parser.
+                    continue
+                if not parsed.username or not parsed.domain:
+                    continue
+                # Only the domain is case-insensitive in the mail standard.
+                key = (parsed.username, parsed.domain.casefold())
+                name = clean(value.get('name') or '')[:120]
+                if key not in contacts:
+                    contacts[key] = {'email': parsed.addr_spec, 'name': name}
+                elif not contacts[key]['name'] and name:
+                    contacts[key]['name'] = name
+    return sorted(contacts.values(), key=lambda c: ((c['name'] or c['email']).casefold(), c['email']))
 
 
 def message_date(row: dict) -> datetime:
@@ -345,13 +411,24 @@ def message_text(raw: str, row: dict) -> str:
 def read_raw(row: dict) -> str:
     """Read the exact account/folder/UID, never marking a message seen."""
     try:
+        key = (row['account'], row.get('mailbox', 'inbox'), str(row['id']))
+        if key in MESSAGE_CACHE:
+            MESSAGE_CACHE.move_to_end(key)
+            return MESSAGE_CACHE[key]
         result = run_himalaya([
             '--account', row['account'], 'message', 'read',
             '--mailbox', row.get('mailbox', 'inbox'), '--raw', '--', str(row['id']),
         ])
         if not isinstance(result.get('message'), str):
             raise ValueError('Unexpected message format')
-        return result['message']
+        raw = result['message']
+        # At most 16 MiB of UTF-8 mail, in memory only, until refresh or exit.
+        # Large attachments are not retained just to accelerate reopening.
+        if len(raw.encode('utf-8')) <= 1024 * 1024:
+            MESSAGE_CACHE[key] = raw
+            if len(MESSAGE_CACHE) > 16:
+                MESSAGE_CACHE.popitem(last=False)
+        return raw
     except Exception:
         # A backend or MIME error could contain credentials or private mail.
         raise RuntimeError('Could not open this message; private diagnostics suppressed.') from None
@@ -738,6 +815,107 @@ def send_confirmed(account: str, message: EmailMessage) -> str:
     return 'SENT. Press u in the message list to refresh the conversation.'
 
 
+# Trusted editor code only. Contacts are decoded as JSON, never evaluated as Lua.
+# Built-in completion and its automatic trigger follow Neovim's documentation:
+# https://github.com/neovim/neovim/blob/v0.11.5/runtime/doc/insert.txt
+EDITOR_LUA = r'''
+local contacts = vim.json.decode(table.concat(vim.fn.readfile(vim.env.HIMALAYA_INBOX_CONTACTS), '\n'))
+for _, contact in ipairs(contacts) do
+  contact.search = vim.fn.tolower(contact.name .. ' ' .. contact.email)
+end
+vim.opt.completeopt = {'menuone', 'noselect', 'noinsert'}
+vim.opt.shortmess:append('c')
+vim.opt.pumheight = 12
+
+-- Return a byte offset and the unfinished recipient, including multiword names.
+-- Never complete body text, quoted headers, or the middle of an existing address.
+local function recipient_prefix()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row, col = cursor[1], cursor[2]
+  local lines = vim.api.nvim_buf_get_lines(0, 0, row, false)
+  for _, line in ipairs(lines) do
+    if line:match('^%s*$') then return end
+  end
+  local header = row
+  while header > 1 and lines[header]:match('^%s') do header = header - 1 end
+  local field, first = lines[header]:match('^([%a%-]+):%s*()')
+  if not field or (field:lower() ~= 'to' and field:lower() ~= 'cc') then return end
+  local line = lines[row]
+  if line:sub(col + 1):match('^%s*[^,%s]') then return end
+  if header ~= row then first = line:match('^%s*()') end
+  local before = line:sub(first, col)
+  local start = before:match('.*,%s*()') or before:match('^%s*()')
+  local base = before:sub(start)
+  if base:find('[<>";:%c]') then return end
+  return first + start - 2, base
+end
+
+function HimalayaInboxComplete(findstart, base)
+  if findstart == 1 then
+    local start = recipient_prefix()
+    return start or -3
+  end
+  local words = {}
+  -- Neovim may move the cursor back to the start while asking for matches.
+  if vim.fn.strchars(base) >= 2 and not base:find('[,<>";:%c]') then
+    local query = vim.fn.tolower(base)
+    for _, contact in ipairs(contacts) do
+      if contact.search:find(query, 1, true) and query ~= vim.fn.tolower(contact.email) then
+        -- Name matching need not match the inserted address's first characters.
+        words[#words + 1] = {word = contact.email, menu = contact.name, equal = 1}
+      end
+    end
+  end
+  return {words = words, refresh = 'always'}
+end
+vim.opt.completefunc = 'v:lua.HimalayaInboxComplete'
+
+local scheduled = false
+vim.api.nvim_create_autocmd('InsertCharPre', {
+  callback = function()
+    if scheduled or vim.fn.state('m') == 'm' then return end
+    scheduled = true
+    vim.schedule(function()
+      scheduled = false
+      if vim.fn.mode() ~= 'i' or vim.fn.pumvisible() == 1 then return end
+      local start, base = recipient_prefix()
+      if start and vim.fn.strchars(base) >= 2 and #HimalayaInboxComplete(0, base).words > 0 then
+        vim.api.nvim_feedkeys(vim.keycode('<C-x><C-u>'), 'n', false)
+      end
+    end)
+  end,
+})
+
+vim.keymap.set('i', '<Tab>', function()
+  return vim.fn.pumvisible() == 1 and '<C-n>' or '<Tab>'
+end, {expr = true})
+vim.keymap.set('i', '<S-Tab>', function()
+  return vim.fn.pumvisible() == 1 and '<C-p>' or '<S-Tab>'
+end, {expr = true})
+vim.keymap.set('i', '<CR>', function()
+  if vim.fn.pumvisible() == 1 then
+    return vim.fn.complete_info({'selected'}).selected >= 0 and '<C-y>' or '<C-e><CR>'
+  end
+  return '<CR>'
+end, {expr = true})
+'''
+
+
+@contextmanager
+def editor_environment() -> Iterator[dict[str, str]]:
+    """Pass contacts privately to Neovim; remove temporary copies after editing."""
+    with tempfile.TemporaryDirectory(prefix='himalaya-inbox-editor-') as directory:
+        paths = {}
+        for name, content in (('init.lua', EDITOR_LUA), ('contacts.json', json.dumps(CONTACTS))):
+            path = Path(directory) / name
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as file:
+                file.write(content)
+            paths[name] = str(path)
+        yield dict(os.environ, NVIM_LOG_FILE='/dev/null',
+                   HIMALAYA_INBOX_INIT=paths['init.lua'], HIMALAYA_INBOX_CONTACTS=paths['contacts.json'])
+
+
 def compose(screen: curses.window, row: dict | None = None, reply_all: bool = False,
             draft_path: Path | None = None) -> str:
     """Edit in Neovim; saving or quitting the editor never sends a message."""
@@ -762,11 +940,12 @@ def compose(screen: curses.window, row: dict | None = None, reply_all: bool = Fa
     while True:
         # No plugins/modelines/swap/undo/shada: untrusted quoted mail must not
         # execute editor code, and draft contents must not leak into other caches.
-        with terminal_child(screen):
+        with editor_environment() as environment, terminal_child(screen):
             result = subprocess.run([editor, '-u', 'NONE', '-n', '-i', 'NONE', '--cmd',
                                      'set nomodeline noswapfile nobackup nowritebackup noundofile',
+                                     '--cmd', 'lua dofile(vim.env.HIMALAYA_INBOX_INIT)',
                                      '+set filetype=mail', '--', str(draft_path)],
-                                    env=dict(os.environ, NVIM_LOG_FILE='/dev/null'))
+                                    env=environment)
         if result.returncode:
             return 'Editor cancelled; draft kept. Press d to resume.'
         try:
@@ -1021,6 +1200,8 @@ def read_settings(path: str | None) -> None:
     except (OSError, ValueError, KeyError):
         raise RuntimeError('Cannot read Himalaya configuration; use --config with a single TOML file.') from None
     CONFIG_ARGS = ['--config', str(config_path)]
+    REFERENCE_CACHE.clear()
+    MESSAGE_CACHE.clear()
 
 
 def main() -> None:

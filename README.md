@@ -11,6 +11,7 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Includes your own sent replies and archived/filed messages in threads, oldest first.
 - Reads plain text or extracts text from HTML without loading remote images or scripts.
 - Replies, replies to all, and composes new mail in Neovim.
+- Suggests recipients automatically by name or address in Neovim's To/Cc fields.
 - Shows the message for review and queues it with a cancellable five-minute delay by default.
 - Offers a custom delay or an explicit send-now confirmation.
 - Keeps unfinished drafts locally so you can resume them.
@@ -21,7 +22,7 @@ The inbox is still the starting view: a thread appears there if it contains an I
 
 - Himalaya **2.1.x**, already configured with working incoming and outgoing authentication.
 - IMAP accounts. Other Himalaya backends are not currently supported by full-conversation browsing.
-- Linux/Unix terminal, Python 3.12+ with curses, [uv](https://docs.astral.sh/uv/), and Neovim.
+- Linux/Unix terminal, Python 3.12+ with curses, [uv](https://docs.astral.sh/uv/), and Neovim 0.11+.
 
 ```sh
 git clone https://github.com/alessionegro99/himalaya-inbox.git
@@ -34,7 +35,7 @@ Ensure `~/.local/bin` is on your PATH. The script uses `uv` to run Python withou
 
 It reads your existing configuration from `$HIMALAYA_CONFIG`, or `$XDG_CONFIG_HOME/himalaya/config.toml` (default `~/.config/himalaya/config.toml`). Use `--config /path/to/config.toml` for a different **single** configuration file. Split/merged config paths are not supported. `HIMALAYA_BIN` can select a different Himalaya executable.
 
-Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Trash/Junk and their configured equivalents. The first load and refresh can take time on large accounts: headers are fetched, but there is no persistent mail index.
+Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Trash/Junk and their configured equivalents. Initial loading still requires network access; there is no persistent mail index. It checks up to two folders concurrently per account. Refresh updates envelope lists and flags, but reuses known messages' threading headers. Recently opened messages are kept in memory for quick reopening/replying; refresh clears that body cache.
 
 ## Keys
 
@@ -69,7 +70,22 @@ Within a conversation, messages are oldest first. `You (sent)` identifies sent c
 
 The account is selected from the original message, and the configured email is used for the From address. Reply-To is honored. Reply-all removes your configured addresses and never copies Bcc recipients. Reply ancestry is retained.
 
-Neovim runs without your plugins, modelines, swap, undo history, or shada to avoid executing anything in quoted email or copying drafts into editor caches.
+The editor is explicitly `nvim`, regardless of `$EDITOR` or `$VISUAL`. It runs without your plugins, modelines, swap, undo history, or shada to avoid executing anything in quoted email or copying drafts into editor caches. The only added editor configuration is the wrapper's recipient completion; your normal Neovim configuration is not changed.
+
+### New messages and recipient suggestions
+
+Press `c` in the inbox and choose the sending account. In Neovim, press `i` to edit the To, Cc, Subject, and body fields.
+
+In **To** or **Cc**, type at least two characters of a name or email address. A popup shows matching addresses and names from already-loaded From/To headers across your accounts, including Sent mail. It does not import Thunderbird's separate address book. Matching is case-insensitive and supports parts of names, multiword names, and addresses; no extra network request is made while typing.
+
+- `Tab` / `Shift-Tab` or `Ctrl-N` / `Ctrl-P`: select the next/previous suggestion.
+- `Enter`: accept the selected address. With no suggestion selected, Enter retains its normal newline behavior.
+- `Ctrl-E`: close the popup and keep what you typed.
+- Type a comma and start typing again to add another recipient.
+
+No suggestion is selected automatically. Only the email address is inserted, and autocomplete stays out of Subject and body text. Check the complete recipient addresses in the review screen: display names from received mail are not verified identities.
+
+Finish editing with `Esc`, then `:wq` and Enter. Review and queue/send as described above; saving in Neovim never sends mail.
 
 ### Enable delayed sending (Linux/systemd)
 
@@ -111,7 +127,8 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 
 - Authentication stays with Himalaya and its configured helpers. This wrapper does not print their raw output, errors, or credentials.
 - Browsing uses read-only/peek fetching and does not mark messages read.
-- Message bodies are fetched only when opened or used to prepare a reply. Remote HTML resources are never fetched; terminal control characters are removed before display.
+- Message bodies are fetched only when opened or used to prepare a reply. A memory-only cache retains at most 16 messages, each at most 1 MiB of UTF-8 text, until refresh or exit. Large messages/attachments are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
+- Recipient suggestions are collected in memory from loaded address headers, not bodies or Bcc. While editing, Neovim receives a private temporary JSON file (permissions 600 inside a 700 directory), removed when the editor returns. No contacts database, mail cache, or personal editor configuration is included in this repository.
 - Drafts are **plaintext**, stored outside the repository under `$XDG_STATE_HOME/himalaya-inbox/drafts` (default `~/.local/state/himalaya-inbox/drafts`). Directory permissions are 700 and draft files start at 600. Protect the laptop/account and its backups accordingly.
 - The scheduled Outbox is also **plaintext**, in `himalaya-inbox/outbox.sqlite3` beside the drafts directory (permissions 600). Pending or uncertain deliveries retain their bodies. Successful deliveries and cancelled entries retain only status metadata; their queued bodies are removed. This is not a guarantee that older backups contain no copies.
 - Sent drafts are removed locally after successful sending and saving. Cancelled or uncertain drafts remain available through `d`.
@@ -128,7 +145,7 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, terminal controls, actual pseudo-terminal and Neovim navigation, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending is mocked; no real messages are sent.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts, bounded caches, concurrent folder loading, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending is mocked; no real messages are sent.
 
 ## Scope and upstream credit
 
