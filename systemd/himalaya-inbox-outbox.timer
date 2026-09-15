@@ -1,0 +1,10 @@
+[Unit]
+Description=Check Himalaya Inbox scheduled mail every 10 seconds
+
+[Timer]
+OnCalendar=*-*-* *:*:0/10
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

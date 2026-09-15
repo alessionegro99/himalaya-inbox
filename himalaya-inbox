@@ -27,12 +27,16 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import textwrap
 import tomllib
+import time
+import uuid
 from contextlib import contextmanager
+from collections.abc import Iterator
 
 
 HIMALAYA = os.environ.get('HIMALAYA_BIN') or shutil.which('himalaya') or str(Path.home() / '.local/bin/himalaya')
@@ -490,6 +494,162 @@ def draft_directory() -> Path:
     return path
 
 
+@contextmanager
+def outbox_db() -> Iterator[sqlite3.Connection]:
+    """Open the private durable queue; SQLite transactions serialize send/cancel."""
+    directory = draft_directory().parent
+    directory.chmod(0o700)
+    path = directory / 'outbox.sqlite3'
+    # Create with private permissions from the outset, not after writing mail.
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    path.chmod(0o600)
+    connection = sqlite3.connect(path, timeout=5)
+    connection.row_factory = sqlite3.Row
+    connection.execute('PRAGMA secure_delete=ON')
+    connection.execute('''CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY, account TEXT NOT NULL, config TEXT NOT NULL,
+        due REAL NOT NULL, created REAL NOT NULL, status TEXT NOT NULL,
+        payload BLOB, note TEXT NOT NULL DEFAULT ''
+    )''')
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+def queue_message(account: str, message: EmailMessage, minutes: int = 5) -> str:
+    """Queue the confirmed immutable message without contacting a mail server."""
+    if not 1 <= minutes <= 1440:
+        raise RuntimeError('Choose a delay between 1 and 1440 minutes.')
+    identifier = uuid.uuid4().hex
+    now = time.time()
+    config = CONFIG_ARGS[-1] if CONFIG_ARGS else str(Path.home() / '.config/himalaya/config.toml')
+    with outbox_db() as connection:
+        connection.execute('INSERT INTO outbox(id,account,config,due,created,status,payload) VALUES(?,?,?,?,?,?,?)',
+                           (identifier, account, config, now + minutes * 60, now, 'pending', message.as_bytes()))
+    return identifier
+
+
+def pending_messages() -> list[dict]:
+    """Return pending and delivery-result records, never backend diagnostics."""
+    with outbox_db() as connection:
+        return [dict(row) for row in connection.execute('SELECT * FROM outbox ORDER BY created DESC')]
+
+
+def cancel_queued(identifier: str) -> bool:
+    """Cancel only while pending; a worker that already claimed it wins the race."""
+    with outbox_db() as connection:
+        cursor = connection.execute("UPDATE outbox SET status='cancelled', payload=NULL, note='Cancelled before sending; local queued copy removed.' WHERE id=? AND status='pending'", (identifier,))
+        return cursor.rowcount == 1
+
+
+def claim_due(now: float | None = None) -> dict | None:
+    """Commit the claim BEFORE any SMTP attempt, preventing duplicate workers.
+
+    A crash after claiming leaves the record in 'sending'; it is NEVER picked up
+    again automatically. The user must inspect Sent before attempting a new send.
+    https://www.sqlite.org/lang_transaction.html
+    """
+    with outbox_db() as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        row = connection.execute("SELECT * FROM outbox WHERE status='pending' AND due<=? ORDER BY due LIMIT 1",
+                                 (time.time() if now is None else now,)).fetchone()
+        if row is None:
+            return None
+        connection.execute("UPDATE outbox SET status='sending', note='Delivery started; cancellation is no longer possible.' WHERE id=?", (row['id'],))
+        return dict(row)
+
+
+def process_outbox() -> None:
+    """Process due messages once each, with no automatic retry after failure."""
+    while item := claim_due():
+        status = 'failed'
+        note = 'Configuration changed or is unavailable; nothing was sent.'
+        try:
+            read_settings(item['config'])
+            message = Parser(policy=policy.default).parsestr(item['payload'].decode('utf-8'))
+            configured = SETTINGS[item['account']]['email'].casefold()
+            actual = {a.casefold() for _, a in getaddresses(message.get_all('From', []))}
+            if actual != {configured}:
+                raise ValueError('Sender identity changed')
+            note = send_confirmed(item['account'], message)
+            status = 'sent' if note.startswith('SENT.') else 'sent-copy-failed' if note.startswith('SENT,') else 'uncertain'
+        except Exception:
+            # Once delivery may have begun, never guess that retrying is safe.
+            status = 'uncertain'
+            note = 'Worker interrupted or configuration unavailable. Check Sent before retrying; no automatic retry.'
+        with outbox_db() as connection:
+            connection.execute('UPDATE outbox SET status=?, note=?, payload=CASE WHEN ?=\'sent\' THEN NULL ELSE payload END WHERE id=?',
+                               (status, note, status, item['id']))
+
+
+def scheduler_active() -> bool:
+    """Do not silently queue mail when no background sender is running."""
+    try:
+        result = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', 'himalaya-inbox-outbox.timer'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def outbox_view(screen: curses.window) -> None:
+    """Inspect scheduled mail and cancel pending deliveries atomically."""
+    screen.keypad(True)
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    selected = 0
+    status = ''
+    screen.timeout(1000)
+    try:
+        while True:
+            items = pending_messages()
+            selected = max(0, min(selected, len(items) - 1))
+            page = max(1, screen.getmaxyx()[0] - 3)
+            top = max(0, selected - page + 1)
+            screen.erase()
+            put_line(screen, 0, 'OUTBOX | Enter details | x cancel scheduled mail | q back', curses.A_BOLD)
+            for y, item in enumerate(items[top:top + page], 1):
+                remaining = max(0, int(item['due'] - time.time()))
+                state = f'queued {remaining // 60}:{remaining % 60:02d}' if item['status'] == 'pending' else item['status']
+                subject = '(local queued body removed)'
+                if item['payload']:
+                    headers = Parser(policy=policy.default).parsestr(item['payload'].decode('utf-8'), headersonly=True)
+                    subject = clean(headers.get('Subject', '(no subject)'))
+                put_line(screen, y, f"{state:<18} {item['account']:<12} {subject}", curses.A_REVERSE if top + y - 1 == selected else 0)
+            if not items:
+                put_line(screen, 1, 'No queued messages.')
+            put_line(screen, screen.getmaxyx()[0] - 1, status or 'Cancellation works until delivery starts. Closing the browser does not cancel mail.')
+            screen.refresh()
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
+            if key in ('q', '\x1b'):
+                return
+            if key in ('j', curses.KEY_DOWN):
+                selected += 1
+            elif key in ('k', curses.KEY_UP):
+                selected -= 1
+            elif key == 'x' and items:
+                status = ('CANCELLED. This email will not be sent.' if cancel_queued(items[selected]['id'])
+                          else 'Cannot cancel: delivery has already started, or this item is no longer queued.')
+            elif key in ('\n', '\r', curses.KEY_ENTER) and items:
+                item = items[selected]
+                text = item['note'] + '\n\n'
+                if item['payload']:
+                    text += message_text(item['payload'].decode('utf-8'), {'account': item['account'], 'id': item['id']})
+                screen.timeout(-1)
+                text_view(screen, text, 'q back to Outbox', {'q'})
+                screen.timeout(1000)
+    finally:
+        screen.timeout(-1)
+
+
 def reply_template(raw: str, account: str, reply_all: bool = False) -> str:
     """Preserve RFC 5322 ancestry and honor Reply-To, excluding own addresses."""
     source = Parser(policy=policy.default).parsestr(raw)
@@ -605,7 +765,8 @@ def compose(screen: curses.window, row: dict | None = None, reply_all: bool = Fa
         with terminal_child(screen):
             result = subprocess.run([editor, '-u', 'NONE', '-n', '-i', 'NONE', '--cmd',
                                      'set nomodeline noswapfile nobackup nowritebackup noundofile',
-                                     '+set filetype=mail', '--', str(draft_path)])
+                                     '+set filetype=mail', '--', str(draft_path)],
+                                    env=dict(os.environ, NVIM_LOG_FILE='/dev/null'))
         if result.returncode:
             return 'Editor cancelled; draft kept. Press d to resume.'
         try:
@@ -617,16 +778,40 @@ def compose(screen: curses.window, row: dict | None = None, reply_all: bool = Fa
                 continue
             return 'Draft kept. Press d to resume.'
         preview = message_text(message.as_string(), {'account': account, 'id': 'new draft'})
-        choice = text_view(screen, preview, 'REVIEW | s send | e edit | q keep draft', {'s', 'e', 'q'})
+        delay = 5
+        while True:
+            choice = text_view(screen, preview, f'REVIEW | s queue {delay}m | t delay | N send NOW | e edit | q draft', {'s', 't', 'N', 'e', 'q'})
+            if choice != 't':
+                break
+            value = input_line(screen, 'Delay in minutes (1-1440, blank = 5): ')
+            if value is not None:
+                try:
+                    new_delay = int(value or '5')
+                    if 1 <= new_delay <= 1440:
+                        delay = new_delay
+                except ValueError:
+                    pass
         if choice == 'e':
             continue
-        if choice != 's' or input_line(screen, 'Type SEND to send this message: ') != 'SEND':
+        if choice not in ('s', 'N'):
+            return 'Not sent. Draft kept; press d to resume.'
+        if choice == 's' and not scheduler_active():
+            text_view(screen, 'The background sender is not active. Enable himalaya-inbox-outbox.timer first. Nothing was queued or sent; your draft is kept.',
+                      'q back', {'q'})
+            return 'Scheduler is not active. Draft kept.'
+        confirmation = 'SEND' if choice == 's' else 'SEND NOW'
+        prompt = f'Type {confirmation} to ' + (f'queue for {delay} minutes: ' if choice == 's' else 'send immediately: ')
+        if input_line(screen, prompt) != confirmation:
             return 'Not sent. Draft kept; press d to resume.'
         screen.erase()
-        put_line(screen, 0, 'Sending once; please wait...')
+        put_line(screen, 0, 'Queueing locally...' if choice == 's' else 'Sending once; please wait...')
         screen.refresh()
-        status = send_confirmed(account, message)
-        if status.startswith('SENT.'):
+        if choice == 's':
+            queue_message(account, message, delay)
+            status = f'QUEUED for {delay} minutes. Press o in the message list for Outbox, then x to cancel before delivery starts.'
+        else:
+            status = send_confirmed(account, message)
+        if status.startswith(('SENT.', 'QUEUED')):
             draft_path.unlink()
         text_view(screen, status, 'q return to browser', {'q'})
         return status
@@ -694,7 +879,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread', curses.A_BOLD)
         put_line(screen, 1, 'Arrows/wheel scroll | Enter open | r reply | R reply all | / filter | q back')
-        put_line(screen, 2, 'c compose | d drafts | u refresh | i inbox | s sent | a all mail | t threads' if not in_thread
+        put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
             put_line(screen, y, entry_line(group), curses.A_REVERSE if y - 3 + top == selected else 0)
@@ -732,6 +917,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             view = {'i': 'inbox', 's': 'sent', 'a': 'all'}[key]
             selected = top = 0
             query = ''
+        elif key == 'o':
+            outbox_view(screen)
         elif key == 'u':
             try:
                 screen.erase()
@@ -837,15 +1024,25 @@ def read_settings(path: str | None) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Combine the INBOX folders of all Himalaya accounts, newest first.')
+    parser = argparse.ArgumentParser(description='Interactive Himalaya inbox, complete conversations, replies and cancellable scheduled sending.')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-n', '--limit', type=positive_int, help='plain-list mode: show only the newest N messages in total')
     group.add_argument('--all', action='store_true', help='fetch every inbox page; may take longer')
     parser.add_argument('--list', action='store_true', help='print a list instead of opening the browser')
     parser.add_argument('--flat', action='store_true', help='start with individual messages instead of conversations')
     parser.add_argument('--config', help='path to a single Himalaya TOML configuration file')
+    parser.add_argument('--outbox', action='store_true', help='open the scheduled-message Outbox directly')
+    parser.add_argument('--process-outbox', action='store_true', help='background worker: send due, explicitly queued messages once')
     parser.epilog = 'Interactive: full conversations across Inbox, Sent and filed mail (excluding Drafts/Trash/Junk). Piped/--list: newest 50 inbox messages unless --all/-n is given.'
     args = parser.parse_args()
+    if args.process_outbox:
+        process_outbox()
+        return
+    if args.outbox:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error('--outbox requires an interactive terminal')
+        curses.wrapper(outbox_view)
+        return
     interactive = not args.list and sys.stdin.isatty() and sys.stdout.isatty()
     if interactive:
         if args.limit is not None:

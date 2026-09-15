@@ -159,7 +159,7 @@ class ReplyTests(unittest.TestCase):
         self.assertIn('Do NOT resend', result)
 
     def test_saving_editor_never_sends_without_exact_confirmation(self) -> None:
-        for decision, confirmation, sent in (('q', 'SEND', False), ('s', 'yes', False), ('s', 'SEND', True)):
+        for decision, confirmation, sent in (('q', 'SEND NOW', False), ('N', 'SEND', False), ('N', 'SEND NOW', True)):
             with tempfile.TemporaryDirectory() as directory:
                 with patch.object(inbox, 'draft_directory', return_value=Path(directory)), \
                         patch.object(inbox, 'read_raw', return_value=SOURCE), \

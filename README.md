@@ -11,7 +11,8 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Includes your own sent replies and archived/filed messages in threads, oldest first.
 - Reads plain text or extracts text from HTML without loading remote images or scripts.
 - Replies, replies to all, and composes new mail in Neovim.
-- Shows the message for review and requires typing `SEND` before sending.
+- Shows the message for review and queues it with a cancellable five-minute delay by default.
+- Offers a custom delay or an explicit send-now confirmation.
 - Keeps unfinished drafts locally so you can resume them.
 
 The inbox is still the starting view: a thread appears there if it contains an Inbox message. Sent-only and archived conversations are available in the Sent and All views. Drafts, Trash, and Junk folders are excluded from the conversation index. Unrelated messages with identical subjects are not merged; missing or malformed threading headers can still leave messages separate.
@@ -45,6 +46,7 @@ Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own
 | `r` / `R` | Reply / reply to all |
 | `c` | Compose a new message; choose the sending account |
 | `d` | Resume a local draft |
+| `o` | Outbox: see countdowns and press `x` to cancel pending mail |
 | `i` / `s` / `a` | Inbox / Sent / all indexed mail |
 | `t` | Toggle conversation grouping |
 | `/` | Filter the list or search an open message |
@@ -60,12 +62,39 @@ Within a conversation, messages are oldest first. `You (sent)` identifies sent c
 2. Edit the recipient/subject fields and write your reply above the quoted text in Neovim.
 3. Save and exit with `:wq`. **This does not send.**
 4. Review the complete message. Press `e` to edit again or `q` to keep the draft.
-5. To send, press `s`, then type `SEND` and Enter.
-6. Press `u` in the message list to refresh your conversation.
+5. Press `s`, then type `SEND` and Enter to **queue for five minutes**. Press `t` on the review screen to choose another delay (1-1440 minutes).
+6. To cancel before delivery starts, press `o` in the message list, select the queued mail and press `x`. You can also open `himalaya-inbox --outbox` directly.
+7. For immediate delivery instead, press capital `N` on the review screen and type **`SEND NOW`**.
+8. Press `u` in the message list to refresh the conversation after delivery.
 
 The account is selected from the original message, and the configured email is used for the From address. Reply-To is honored. Reply-all removes your configured addresses and never copies Bcc recipients. Reply ancestry is retained.
 
 Neovim runs without your plugins, modelines, swap, undo history, or shada to avoid executing anything in quoted email or copying drafts into editor caches.
+
+### Enable delayed sending (Linux/systemd)
+
+Install the per-user background timer after installing the executable:
+
+```sh
+mkdir -p "$HOME/.config/systemd/user"
+install -m 644 systemd/himalaya-inbox-outbox.service systemd/himalaya-inbox-outbox.timer "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now himalaya-inbox-outbox.timer
+```
+
+The timer checks every 10 seconds, so delivery starts **no earlier than** the chosen delay and normally within about 10 seconds after it. Closing the browser does not cancel queued mail. The laptop must be awake, logged in, online and able to unlock the configured mail credentials; overdue mail is processed after the timer next runs. This is a local queue, not a provider-hosted scheduling service.
+
+The browser refuses to queue silently if the timer is not active. Immediate sending does not require systemd. To pause all delayed deliveries:
+
+```sh
+systemctl --user stop himalaya-inbox-outbox.timer
+```
+
+Stopping the timer does not recall a delivery already in progress and does not remove queued messages. Re-enabling it can send overdue pending messages; inspect/cancel them in Outbox first.
+
+If you customize `XDG_STATE_HOME` or `HIMALAYA_BIN`, set the same values in the user service with `systemctl --user edit himalaya-inbox-outbox.service` so the browser and worker use the same queue and executable.
+
+Cancellation and delivery claims are serialized with SQLite transactions. If cancellation succeeds, the queued body is removed and cannot be sent. Once a worker claims an item, it is no longer cancellable. A crashed/interrupted worker leaves the item out of the retry queue; check Sent if an item remains `sending` or reports `uncertain`. This deliberately favors avoiding duplicate or unintended mail over automatic retries.
 
 ### Plain listing
 
@@ -84,7 +113,9 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 - Browsing uses read-only/peek fetching and does not mark messages read.
 - Message bodies are fetched only when opened or used to prepare a reply. Remote HTML resources are never fetched; terminal control characters are removed before display.
 - Drafts are **plaintext**, stored outside the repository under `$XDG_STATE_HOME/himalaya-inbox/drafts` (default `~/.local/state/himalaya-inbox/drafts`). Directory permissions are 700 and draft files start at 600. Protect the laptop/account and its backups accordingly.
+- The scheduled Outbox is also **plaintext**, in `himalaya-inbox/outbox.sqlite3` beside the drafts directory (permissions 600). Pending or uncertain deliveries retain their bodies. Successful deliveries and cancelled entries retain only status metadata; their queued bodies are removed. This is not a guarantee that older backups contain no copies.
 - Sent drafts are removed locally after successful sending and saving. Cancelled or uncertain drafts remain available through `d`.
+- After scheduling, the draft moves into Outbox. Cancelling there removes the queued body rather than restoring a draft.
 - Delivery is attempted once. An error or timeout can mean delivery is uncertain: **check Sent before retrying**. The program never retries automatically.
 - Sending and saving the Sent copy are separate operations. If sending succeeds but saving fails, the UI explicitly says not to resend. Gmail's automatic SMTP Sent copy is not duplicated.
 - No test in this repository authenticates to a real account or sends real mail. All fixtures use synthetic addresses.
@@ -97,7 +128,7 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, terminal controls, actual pseudo-terminal navigation, reply recipients, confirmation, and uncertain-delivery behavior. Sending is mocked; no real messages are sent.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, terminal controls, actual pseudo-terminal and Neovim navigation, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending is mocked; no real messages are sent.
 
 ## Scope and upstream credit
 

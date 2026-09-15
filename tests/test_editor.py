@@ -64,9 +64,9 @@ class EditorIntegrationTests(unittest.TestCase):
                     os.write(master, b'GoSynthetic editor reply\x1b:wq\r')
                     expect(b'REVIEW')
                     if send:
-                        os.write(master, b's')
-                        expect(b'Type SEND')
-                        os.write(master, b'SEND\r')
+                        os.write(master, b'N')
+                        expect(b'Type SEND NOW')
+                        os.write(master, b'SEND NOW\r')
                         expect(b'Synthetic transport only')
                     os.write(master, b'q')
                     expect(b'EDITOR_TEST_FINISHED')

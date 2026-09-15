@@ -11,6 +11,7 @@ draft-*.txt
 *.mbox
 *.maildir/
 *.log
+.nvimlog
 *.sqlite*
 *.db
 *.db-*

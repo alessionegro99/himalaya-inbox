@@ -229,6 +229,9 @@ class FakeScreen:
     def clrtoeol(self):
         pass
 
+    def timeout(self, value):
+        self.timeout_value = value
+
 
 if __name__ == '__main__':
     unittest.main()
