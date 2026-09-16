@@ -45,13 +45,18 @@ Folder discovery and change checks run concurrently. On servers supporting persi
 
 The highlighted message is preloaded read-only. Opening it shares any in-flight download instead of starting another one. Recently opened messages and normal-sized attachments stay in a bounded RAM cache across refreshes if their identities still match. Press `q` to leave a loading message; quitting the client stops its outstanding background read processes. Message bodies are not persisted on disk by this cache.
 
+Opening a message marks it read and removes its `*`. Selecting/preloading a message or opening the conversation list does not mark it read. Press `*` on a message, or inside the reader, to toggle read/unread. On a conversation summary, `*` marks the whole conversation read if any message is unread; otherwise it marks the conversation unread. Open the conversation first to change just one message.
+
+Read/unread changes appear immediately and save to the mail server in the background, in the order you requested them. A failed save restores the last confirmed status and shows a warning; press `u` to check the server. A refresh already in progress cannot undo a newer action. Normal exit waits for pending read/unread saves; Escape returns to browsing while they finish.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
 | Arrows, `j`/`k`, mouse wheel | Scroll/select |
 | Page Up/Down, `g`/`G` | Page or jump to beginning/end |
-| Enter | Open a conversation, then a message |
+| Enter | Open a conversation, then a message (marks that message read) |
+| `*` | Toggle read/unread for the selected message/conversation, or the open message |
 | `r` / `R` | Reply / reply to all |
 | `c` | Compose a new message; choose the sending account |
 | `d` | Resume a local draft |
@@ -153,7 +158,7 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 ## Privacy and sending safety
 
 - Authentication stays with Himalaya and its configured helpers. This wrapper does not print their raw output, errors, or credentials.
-- Browsing uses read-only/peek fetching and does not mark messages read.
+- Header browsing and preloading use read-only/peek fetching. Opening a message marks it read; `*` changes read/unread explicitly. Only the Seen flag is changed; other flags are preserved. These changes synchronize through your mail server to other clients.
 - Headers (including subjects and From/To addresses) are cached as **plaintext** under `$XDG_CACHE_HOME/himalaya-inbox` (default `~/.cache/himalaya-inbox`), with directory permissions 700 and file permissions 600. This cache contains no message bodies, Bcc fields, passwords, OAuth tokens, or account configuration. It is isolated by a hash of the configuration and written atomically. Removing this directory forces a full header reload next time.
 - Message bodies are fetched when highlighted, opened, or used to prepare a reply, without marking messages read. The RAM cache retains at most 16 messages, at most 32 MiB each and 64 MiB combined in UTF-8 encoding, until exit. Refresh preserves only bodies whose account/folder/UID validity/UID/Message-ID still match. Larger messages are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
 - Recipient suggestions are collected in memory from loaded address headers, not bodies or Bcc. While editing, Neovim receives a private temporary JSON file (permissions 600 inside a 700 directory), removed when the editor returns. No contacts database, mail cache, or personal editor configuration is included in this repository.
@@ -173,7 +178,7 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending and attachment viewers are mocked; no real messages are sent.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, automatic read marking, read/unread toggles and ordered saves, refresh races and failed-save rollback, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending, read/unread writes and attachment viewers are mocked; no real messages are sent or marked by the tests.
 
 ## Scope and upstream credit
 

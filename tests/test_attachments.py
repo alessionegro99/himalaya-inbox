@@ -141,6 +141,7 @@ class IncomingAttachmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             screen = FakeScreen(['a', '\n', 's', 'o', 'q', 'q', 'q'])
             with patch.object(inbox, 'read_raw', return_value=attachment().as_string()) as fetch, \
+                    patch.object(inbox, 'mark_seen', return_value=''), \
                     patch.object(inbox, 'download_directory', return_value=Path(directory)), \
                     patch.object(inbox, 'open_attachment', return_value='Opened.') as launch:
                 inbox.show_message(screen, dict(row('test', '42', 'one'), mailbox='Archive'))

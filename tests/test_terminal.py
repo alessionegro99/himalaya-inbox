@@ -35,6 +35,15 @@ def child() -> None:
         return {'message': message.as_string()}
 
     inbox.run_himalaya = fake_read
+    flag_calls = []
+
+    def fake_flags(args, data=None):
+        assert args[2:4] in (['flag', 'add'], ['flag', 'remove'])
+        assert args[4:8] == ['--mailbox', 'inbox', '--flag', 'seen']
+        flag_calls.append(args)
+        return b''
+
+    inbox.run_private = fake_flags
     with tempfile.TemporaryDirectory() as directory:
         inbox.download_directory = lambda: Path(directory)
 
@@ -45,6 +54,9 @@ def child() -> None:
         inbox.open_attachment = mock_viewer
         curses.wrapper(inbox.browse, rows)
         assert len(list(Path(directory).iterdir())) == 1
+        assert [(args[1], args[3], args[-1]) for args in flag_calls] == [
+            ('test', 'add', '1'), ('test', 'remove', '1'),
+            ('test', 'add', '1'), ('other', 'add', '2')]
 
 
 pid, master = pty.fork()
@@ -75,7 +87,9 @@ try:
     expect(b'SYNTHETIC_SINGLE')
     os.write(master, b'\r')
     expect(b'SYNTHETIC_BODY_test_1_LINE_000')
-    os.write(master, b'a')
+    # Test read/unread in the real reader. Curses may update just "un" in
+    # the footer, so verify the backend call sequence in the child instead.
+    os.write(master, b'*a')
     expect(b'ATTACHMENTS')
     os.write(master, b'\r')
     # Curses retains the unchanged ATTACHMENT prefix from the previous screen.
@@ -91,7 +105,7 @@ try:
     expect(b'LINE_070')
     # Curses can update only the changed digits; do not expect full lines to be
     # re-emitted after a scroll. Unit tests check the resulting line positions.
-    os.write(master, b'gGq')
+    os.write(master, b'*gGq')
     expect(b'Unified inbox')
     # Down arrow in xterm application mode, then open the conversation.
     os.write(master, b'\x1bOB\r')

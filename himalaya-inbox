@@ -43,7 +43,7 @@ import tomllib
 import time
 import uuid
 from contextlib import contextmanager
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterator
 
 
@@ -59,7 +59,11 @@ MESSAGE_CACHE_LIMIT = 64 * 1024 * 1024
 FOLDER_CACHE: dict[tuple[str, str], dict] = {}
 HEADER_CACHE_PATH: Path | None = None
 HEADER_CACHE_READY = False
+HEADER_CACHE_LOCK = Lock()
 REFRESH_JOB: Future | None = None
+REFRESH_SEEN_STATES: dict = {}
+SEEN_STATES: dict[tuple, dict] = {}
+SEEN_QUEUE: deque = deque()
 PREFETCH_ENABLED = False
 PREFETCH_JOB: Future | None = None
 PREFETCH_KEY: tuple | None = None
@@ -365,6 +369,12 @@ def read_header_cache() -> None:
 
 
 def write_header_cache() -> None:
+    """Serialize cache writers so a refresh cannot undo a just-saved read flag."""
+    with HEADER_CACHE_LOCK:
+        _write_header_cache()
+
+
+def _write_header_cache() -> None:
     """Atomically persist headers only, never bodies, passwords or configuration."""
     if HEADER_CACHE_PATH is None:
         return
@@ -375,9 +385,21 @@ def write_header_cache() -> None:
         directory.chmod(0o700)
         fields = {'account', 'mailbox', 'id', 'message-id', 'in-reply-to', 'references', 'from', 'to',
                   'date', 'flags', 'subject', 'in_inbox', 'sent', 'uidvalidity'}
-        data = {'version': 2, 'accounts': sorted(SETTINGS), 'folders': [dict(account=account, mailbox=mailbox, state=item['state'],
-                                            rows=[{key: value for key, value in row.items() if key in fields} for row in item['rows']])
-                                       for (account, mailbox), item in FOLDER_CACHE.items()]}
+        folders = []
+        for (account, mailbox), item in FOLDER_CACHE.copy().items():
+            rows = []
+            for row in item['rows']:
+                cached = {key: value for key, value in row.items() if key in fields}
+                change = SEEN_STATES.get(message_cache_key(row))
+                if change is not None:
+                    # Never persist an optimistic flag. Recheck this folder on
+                    # the next refresh, including after an uncertain failure.
+                    item['state'] = None
+                    if change['saved']:
+                        set_seen_flag(cached, change['confirmed'])
+                rows.append(cached)
+            folders.append(dict(account=account, mailbox=mailbox, state=item['state'], rows=rows))
+        data = {'version': 2, 'accounts': sorted(SETTINGS), 'folders': folders}
         descriptor, name = tempfile.mkstemp(prefix='.headers-', dir=directory)
         temporary = Path(name)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as file:
@@ -549,11 +571,126 @@ def clean(value: object) -> str:
 
 
 def is_unread(row: dict) -> bool:
-    """Inspect flags without modifying the message."""
-    return not any(
-        flag.get('iana') == 'seen' or flag.get('raw', '').lower() == '\\seen'
-        for flag in row.get('flags', [])
-    )
+    """Include the latest local action while its server update is in flight."""
+    change = SEEN_STATES.get(message_cache_key(row))
+    if change is not None:
+        return not change['seen']
+    return not has_seen_flag(row)
+
+
+def has_seen_flag(row: dict) -> bool:
+    """Inspect the server flags, independently of pending UI changes."""
+    return any(is_seen_flag(flag) for flag in row.get('flags', []))
+
+
+def is_seen_flag(flag: dict) -> bool:
+    """Accept both standard and raw IMAP flag representations."""
+    return str(flag.get('iana', '')).lower() == 'seen' or str(flag.get('raw', '')).lower() == '\\seen'
+
+
+def set_seen_flag(row: dict, seen: bool) -> None:
+    """Change only Seen; retain Answered, Flagged and all custom flags."""
+    row['flags'] = [flag for flag in row.get('flags', []) if not is_seen_flag(flag)]
+    if seen:
+        row['flags'].append({'iana': 'seen'})
+
+
+def save_seen(row: dict, seen: bool) -> None:
+    """Persist one scoped flag without trusting an unverified cached UID."""
+    account, mailbox, uid, validity, mid = message_cache_key(row)
+    if not uid.isdigit() or int(uid) < 1:
+        raise RuntimeError('Invalid message ID; refresh before changing read status.')
+    if validity is not None:
+        state = mailbox_states(account, [mailbox]).get(mailbox)
+        if state is None or state['UIDVALIDITY'] != validity:
+            raise RuntimeError('Mailbox identity changed; refresh before changing read status.')
+    elif row.get('_cached'):
+        if not mid:
+            raise RuntimeError('Refresh before changing this cached message.')
+        raw = run_himalaya(['--account', account, 'message', 'read', '--mailbox', mailbox, '--raw', '--', uid])['message']
+        headers = BytesParser(policy=policy.default).parsebytes(raw.encode('utf-8'), headersonly=True)
+        if normalized_id(headers.get('Message-ID')) != mid:
+            raise RuntimeError('Message identity changed; refresh before changing read status.')
+    # add/remove, not set: other flags must survive. See Himalaya 2.1
+    # `flag add --help` / `flag remove --help` for the mailbox-scoped syntax.
+    run_private(['--account', account, 'flag', 'add' if seen else 'remove',
+                 '--mailbox', mailbox, '--flag', 'seen', '--', uid])
+
+
+def mark_seen(rows: list[dict], seen: bool) -> str:
+    """Update the display immediately; serialize network writes in UI order."""
+    for row in rows:
+        if is_unread(row) != seen:
+            continue
+        key = message_cache_key(row)
+        previous = SEEN_STATES.get(key, {})
+        # Replace the record on every action. A refresh may retire only the
+        # settled records it started with, never a newer user action.
+        SEEN_STATES[key] = dict(seen=seen, confirmed=previous.get('confirmed', has_seen_flag(row)),
+                                saved=previous.get('saved', False), pending=previous.get('pending', 0) + 1)
+        SEEN_QUEUE.append(dict(row=dict(row), seen=seen, job=None))
+    return poll_seen_changes() or ('Saving read/unread changes...' if SEEN_QUEUE else '')
+
+
+def poll_seen_changes(status: str = '') -> str:
+    """Collect writes on the UI thread; roll failed changes back visibly."""
+    changed = False
+    while SEEN_QUEUE:
+        request = SEEN_QUEUE[0]
+        if request['job'] is None:
+            request['job'] = background(save_seen, request['row'], request['seen'])
+        if not request['job'].done():
+            break
+        SEEN_QUEUE.popleft()
+        state = SEEN_STATES[message_cache_key(request['row'])]
+        try:
+            request['job'].result()
+            state['confirmed'] = request['seen']
+            state['saved'] = True
+            if not status.startswith('Could not save read status'):
+                status = 'Marked read.' if request['seen'] else 'Marked unread.'
+        except Exception:
+            status = 'Could not save read status; press u to check. Private diagnostics suppressed.'
+        state['pending'] -= 1
+        if not state['pending']:
+            state['seen'] = state['confirmed']
+        cached = FOLDER_CACHE.get((request['row']['account'], request['row'].get('mailbox', 'inbox')))
+        if cached is not None:
+            cached['state'] = None
+        changed = True
+    if changed:
+        write_header_cache()
+    return status
+
+
+def start_refresh() -> None:
+    """Remember which saved read states can safely yield to the new snapshot."""
+    global REFRESH_JOB, REFRESH_SEEN_STATES
+    REFRESH_SEEN_STATES = {key: state for key, state in SEEN_STATES.items() if not state['pending']}
+    REFRESH_JOB = background(load_all)
+
+
+def wait_seen_changes(screen: curses.window) -> str:
+    """Finish requested writes before normal exit; Escape returns to browsing."""
+    error = ''
+    while SEEN_QUEUE:
+        status = poll_seen_changes()
+        if status.startswith('Could not'):
+            error = status
+        if not SEEN_QUEUE:
+            break
+        screen.erase()
+        put_line(screen, 0, 'Saving read/unread changes before exit... Esc to keep browsing')
+        screen.refresh()
+        screen.timeout(100)
+        try:
+            if screen.get_wch() in ('q', '\x1b'):
+                return error or 'Read/unread changes are still saving.'
+        except curses.error:
+            pass
+        finally:
+            screen.timeout(-1)
+    return error
 
 
 def conversations(rows: list[dict]) -> list[list[dict]]:
@@ -862,7 +999,7 @@ def read_message(row: dict) -> str:
 def show_message(screen: curses.window, row: dict) -> None:
     """Read a message and reply without leaving the interactive browser."""
     screen.erase()
-    put_line(screen, 0, 'Opening message (read-only)... q back')
+    put_line(screen, 0, 'Opening message... q back')
     screen.refresh()
     with MESSAGE_CACHE_LOCK:
         ready = message_cache_key(row) in MESSAGE_CACHE
@@ -883,12 +1020,16 @@ def show_message(screen: curses.window, row: dict) -> None:
         text = message_text(raw, row)
     except Exception:
         raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
-    status = ''
+    status = mark_seen([row], True)
     while True:
-        key = text_view(screen, text, 'r reply | R reply all | a attachments | / search | q back', {'r', 'R', 'a', 'q'}, status)
+        key = text_view(screen, text, 'r reply | R reply all | * read/unread | a attachments | / search | q back',
+                        {'r', 'R', '*', 'a', 'q'}, status)
         if key == 'q':
             return
-        status = show_attachments(screen, raw) if key == 'a' else compose(screen, row, reply_all=key == 'R')
+        if key == '*':
+            status = mark_seen([row], is_unread(row))
+        else:
+            status = show_attachments(screen, raw) if key == 'a' else compose(screen, row, reply_all=key == 'R')
 
 
 @contextmanager
@@ -932,6 +1073,7 @@ def text_view(screen: curses.window, text: str, help_text: str,
     offset = 0
     query = ''
     while True:
+        status = poll_seen_changes(status)
         height, width = screen.getmaxyx()
         page = max(1, height - 2)
         lines = [part for line in text.splitlines()
@@ -941,9 +1083,21 @@ def text_view(screen: curses.window, text: str, help_text: str,
         put_line(screen, 0, help_text, curses.A_BOLD)
         for y, line in enumerate(lines[offset:offset + page], 1):
             put_line(screen, y, line)
-        put_line(screen, height - 1, status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | arrows/wheel scroll')
+        footer = status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | arrows/wheel scroll'
+        if SEEN_QUEUE:
+            footer = 'Saving read/unread changes... | ' + footer
+        put_line(screen, height - 1, footer)
         screen.refresh()
-        key = screen.get_wch()
+        polling = bool(SEEN_QUEUE)
+        try:
+            if polling:
+                screen.timeout(100)
+            key = screen.get_wch()
+        except curses.error:
+            continue
+        finally:
+            if polling:
+                screen.timeout(-1)
         if isinstance(key, str) and key in actions:
             return key
         if key in ('j', curses.KEY_DOWN):
@@ -1622,12 +1776,17 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
     view = 'inbox'
     filtered = []
     while True:
+        status = poll_seen_changes(status)
         anchor = set()
         if REFRESH_JOB is not None and REFRESH_JOB.done():
             if 0 <= selected < len(filtered):
                 anchor = {row_anchor(row) for row in filtered[selected]}
             try:
                 fresh = REFRESH_JOB.result()
+                for key, state in REFRESH_SEEN_STATES.items():
+                    if SEEN_STATES.get(key) is state:
+                        del SEEN_STATES[key]
+                write_header_cache()
                 old_thread = {row_anchor(row) for row in rows} if in_thread else set()
                 catalog[:] = fresh
                 if in_thread:
@@ -1635,10 +1794,12 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                                   if any(row_anchor(row) in old_thread for row in group)), [])
                     fresh.sort(key=message_date)
                 rows[:] = fresh
-                status = 'Refreshed.'
+                if not status.startswith('Could not save read status'):
+                    status = 'Refreshed.'
             except Exception:
                 status = 'Refresh failed; showing previous headers. Press u to retry.'
             REFRESH_JOB = None
+            REFRESH_SEEN_STATES.clear()
         entries = conversations(rows) if threaded else [[row] for row in rows]
         if not in_thread and view != 'all':
             entries = [group for group in entries if any(
@@ -1661,7 +1822,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         mode = 'conversations' if threaded else 'messages'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread', curses.A_BOLD)
-        put_line(screen, 1, 'Arrows/wheel scroll | Enter open | r reply | R reply all | / filter | q back')
+        put_line(screen, 1, 'Arrows/wheel scroll | Enter open | * read/unread | r/R reply/all | / filter | q back')
         put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
@@ -1671,11 +1832,13 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         footer = f'Filter: {query}' if editing or query else status or f'{selected + 1 if filtered else 0}/{len(filtered)}'
         if REFRESH_JOB is not None:
             footer = 'Previous headers; refreshing in background | ' + footer
+        if SEEN_QUEUE:
+            footer = 'Saving read/unread changes... | ' + footer
         put_line(screen, height - 1, footer, curses.A_BOLD)
         screen.refresh()
         if PREFETCH_ENABLED and filtered:
             prefetch_message(min(filtered[selected], key=message_date))
-        polling = REFRESH_JOB is not None or (PREFETCH_ENABLED and PREFETCH_JOB is not None and not PREFETCH_JOB.done())
+        polling = bool(SEEN_QUEUE) or REFRESH_JOB is not None or (PREFETCH_ENABLED and PREFETCH_JOB is not None and not PREFETCH_JOB.done())
         try:
             if polling:
                 screen.timeout(100)
@@ -1698,6 +1861,10 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             continue
         status = ''
         if key in ('q', 'Q'):
+            if not in_thread:
+                status = wait_seen_changes(screen)
+                if status:
+                    continue
             return
         if key == '/':
             editing = True
@@ -1714,7 +1881,10 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             outbox_view(screen)
         elif key == 'u':
             if REFRESH_JOB is None:
-                REFRESH_JOB = background(load_all)
+                start_refresh()
+        elif key == '*' and filtered:
+            group = filtered[selected]
+            status = mark_seen(group, any(is_unread(row) for row in group))
         elif key in ('r', 'R', 'c', 'd'):
             try:
                 if key == 'c':
@@ -1811,6 +1981,9 @@ def read_settings(path: str | None, cache: bool = False) -> None:
     with MESSAGE_CACHE_LOCK:
         MESSAGE_CACHE.clear()
     FOLDER_CACHE.clear()
+    SEEN_STATES.clear()
+    SEEN_QUEUE.clear()
+    REFRESH_SEEN_STATES.clear()
     HEADER_CACHE_PATH = None
     HEADER_CACHE_READY = False
     if cache:
@@ -1857,7 +2030,7 @@ def main() -> None:
             if HEADER_CACHE_READY:
                 rows = deduplicate([dict(row, _cached=True) for item in FOLDER_CACHE.values() for row in item['rows']])
                 CONTACTS = collect_contacts(rows)
-                REFRESH_JOB = background(load_all)
+                start_refresh()
             else:
                 print('Building the local header index for the first time...', file=sys.stderr, flush=True)
                 rows = load_all()
@@ -1866,6 +2039,8 @@ def main() -> None:
         finally:
             PREFETCH_ENABLED = False
             stop_background()
+            if SEEN_QUEUE:
+                print('Some read/unread changes may not have saved; reopen and refresh to check.', file=sys.stderr)
         return
     if args.config:
         read_settings(args.config)
