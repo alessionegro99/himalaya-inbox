@@ -59,6 +59,7 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | Page Up/Down, `g`/`G` | Page or jump to beginning/end |
 | Enter | Open a conversation, then a message (marks that message read) |
 | `*` | Toggle read/unread for the selected message/conversation, or the open message |
+| `x` in the message list or reader | Move one message to Trash, after confirmation |
 | `r` / `R` | Reply / reply to all |
 | `c` | Compose a new message; choose the sending account |
 | `d` | Resume a local draft |
@@ -73,6 +74,12 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | `q` | Go back or quit |
 
 Within a conversation, messages are oldest first. `You (sent)` identifies sent copies. A reply from a conversation summary targets its latest received message; open the conversation and select another message to reply to that one instead.
+
+### Moving mail to Trash
+
+Select a message and press `x`, or press `x` while reading it. Review the subject, account and destination, then press `y` to move it to that account's configured Trash folder. Press `n`, Escape or `q` to cancel. On a conversation summary, first choose **one** message; the rest of the conversation, including your replies, is left alone. The `d` key still opens drafts.
+
+This uses Himalaya's `message move`, never permanent deletion or expunge. Restore a message from the account's Trash folder in Thunderbird or webmail, subject to the provider's retention policy. A failed or interrupted move is not retried automatically: check Trash and press `u` before trying again. Successfully moved messages are removed from the view and local header/body caches; an older in-flight refresh cannot put the old message back. Tests use synthetic mail and do not move real emails.
 
 ### Replying
 

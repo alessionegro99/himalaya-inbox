@@ -67,6 +67,7 @@ AUTO_REFRESH_INTERVAL = 5 * 60
 AUTO_REFRESH_ENABLED = False
 SEEN_STATES: dict[tuple, dict] = {}
 SEEN_QUEUE: deque = deque()
+TRASHED_MESSAGES: set[tuple] = set()
 PREFETCH_ENABLED = False
 PREFETCH_JOB: Future | None = None
 PREFETCH_KEY: tuple | None = None
@@ -392,6 +393,9 @@ def _write_header_cache() -> None:
         for (account, mailbox), item in FOLDER_CACHE.copy().items():
             rows = []
             for row in item['rows']:
+                if message_cache_key(row) in TRASHED_MESSAGES:
+                    item['state'] = None
+                    continue
                 cached = {key: value for key, value in row.items() if key in fields}
                 change = SEEN_STATES.get(message_cache_key(row))
                 if change is not None:
@@ -500,6 +504,7 @@ def load_all() -> list[dict]:
     global CONTACTS, REFERENCE_CACHE, PREFETCH_KEY
     with ThreadPoolExecutor(max_workers=min(len(SETTINGS), 5)) as pool:
         rows = deduplicate([row for batch in pool.map(load_account, SETTINGS) for row in batch])
+    rows = without_trashed(rows)
     CONTACTS = collect_contacts(rows)
     # A Message-ID identifies an immutable message (the same identity used by
     # deduplicate). Scope by account, never reuse a bare mailbox UID after reset.
@@ -598,22 +603,28 @@ def set_seen_flag(row: dict, seen: bool) -> None:
         row['flags'].append({'iana': 'seen'})
 
 
-def save_seen(row: dict, seen: bool) -> None:
-    """Persist one scoped flag without trusting an unverified cached UID."""
+def verify_message_uid(row: dict) -> None:
+    """Check a scoped UID before changing server state; cached IDs need proof."""
     account, mailbox, uid, validity, mid = message_cache_key(row)
     if not uid.isdigit() or int(uid) < 1:
-        raise RuntimeError('Invalid message ID; refresh before changing read status.')
+        raise RuntimeError('Invalid message ID; refresh before changing this message.')
     if validity is not None:
         state = mailbox_states(account, [mailbox]).get(mailbox)
         if state is None or state['UIDVALIDITY'] != validity:
-            raise RuntimeError('Mailbox identity changed; refresh before changing read status.')
+            raise RuntimeError('Mailbox identity changed; refresh before changing this message.')
     elif row.get('_cached'):
         if not mid:
             raise RuntimeError('Refresh before changing this cached message.')
         raw = run_himalaya(['--account', account, 'message', 'read', '--mailbox', mailbox, '--raw', '--', uid])['message']
         headers = BytesParser(policy=policy.default).parsebytes(raw.encode('utf-8'), headersonly=True)
         if normalized_id(headers.get('Message-ID')) != mid:
-            raise RuntimeError('Message identity changed; refresh before changing read status.')
+            raise RuntimeError('Message identity changed; refresh before changing this message.')
+
+
+def save_seen(row: dict, seen: bool) -> None:
+    """Persist one scoped flag without trusting an unverified cached UID."""
+    verify_message_uid(row)
+    account, mailbox, uid, _, _ = message_cache_key(row)
     # add/remove, not set: other flags must survive. See Himalaya 2.1
     # `flag add --help` / `flag remove --help` for the mailbox-scoped syntax.
     run_private(['--account', account, 'flag', 'add' if seen else 'remove',
@@ -698,7 +709,7 @@ def auto_refresh() -> None:
         start_refresh()
 
 
-def wait_seen_changes(screen: curses.window) -> str:
+def wait_seen_changes(screen: curses.window, action: str = 'exit') -> str:
     """Finish requested writes before normal exit; Escape returns to browsing."""
     error = ''
     while SEEN_QUEUE:
@@ -708,7 +719,7 @@ def wait_seen_changes(screen: curses.window) -> str:
         if not SEEN_QUEUE:
             break
         screen.erase()
-        put_line(screen, 0, 'Saving read/unread changes before exit... Esc to keep browsing')
+        put_line(screen, 0, f'Saving read/unread changes before {action}... Esc to keep browsing')
         screen.refresh()
         screen.timeout(100)
         try:
@@ -719,6 +730,86 @@ def wait_seen_changes(screen: curses.window) -> str:
         finally:
             screen.timeout(-1)
     return error
+
+
+def without_trashed(rows: list[dict]) -> list[dict]:
+    """Keep a stale in-flight refresh from restoring a successfully moved UID.
+
+    Suppression is session-only and scoped by account, folder and UIDVALIDITY.
+    Restoring from Trash assigns a new source-folder UID, so it remains visible.
+    https://www.rfc-editor.org/rfc/rfc9051#section-2.3.1.1
+    """
+    return [row for row in rows if message_cache_key(row) not in TRASHED_MESSAGES]
+
+
+def trash_folder(row: dict) -> str:
+    """Use the account's explicit Trash mapping; never guess or delete in place."""
+    aliases = SETTINGS.get(row['account'], {}).get('mailbox', {}).get('alias', {})
+    aliases = {name.casefold(): value for name, value in aliases.items()}
+    destination = aliases.get('trash')
+    if not isinstance(destination, str) or not destination.strip() or not all(c.isprintable() for c in destination):
+        raise RuntimeError('Configure mailbox.alias.trash for this account before moving messages.')
+    source = row.get('mailbox', 'inbox')
+    source = aliases.get(source.casefold(), source)
+    if source.casefold() == destination.casefold():
+        raise RuntimeError('This message is already in Trash; nothing was removed.')
+    return destination
+
+
+def move_to_trash(row: dict, destination: str) -> None:
+    """Move one verified message once; never invoke delete, expunge or retry."""
+    if destination != trash_folder(row):
+        raise RuntimeError('Trash destination changed; confirm it again.')
+    # Even without UIDVALIDITY, verify a fresh Message-ID before this move.
+    verify_message_uid(dict(row, _cached=True))
+    run_private(['--account', row['account'], 'message', 'move',
+                 '--from', row.get('mailbox', 'inbox'), '--to', destination, '--', str(row['id'])])
+
+
+def trash_message(screen: curses.window, row: dict) -> str:
+    """Confirm one exact message, move it to Trash, then retire its old UID."""
+    try:
+        destination = trash_folder(row)
+    except RuntimeError as error:
+        return str(error)
+    details = '\n'.join([
+        'Move this message to Trash?', '',
+        f'Subject: {clean(row.get("subject") or "(no subject)")}',
+        f'From: {clean(row.get("from", []))}',
+        f'Account: {clean(row["account"])}',
+        f'Folder: {clean(row.get("mailbox", "inbox"))} -> {clean(destination)}', '',
+        'Only this message will be moved, not the whole conversation.',
+        'Restore it from Trash in Thunderbird or webmail. No permanent deletion.',
+    ])
+    if text_view(screen, details, 'y move to Trash | n / Esc / q cancel', {'y', 'Y', 'n', 'N', 'q', '\x1b'}) not in ('y', 'Y'):
+        return 'Cancelled; nothing moved.'
+    status = wait_seen_changes(screen, 'moving to Trash')
+    if status:
+        return status + ' Nothing moved to Trash.'
+    screen.erase()
+    put_line(screen, 0, 'Moving this message to Trash...')
+    screen.refresh()
+    try:
+        move_to_trash(row, destination)
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, KeyboardInterrupt):
+        # An interrupted/failed command can be uncertain: retain the message
+        # locally, force a fresh folder check, and never retry the move for them.
+        cached = FOLDER_CACHE.get((row['account'], row.get('mailbox', 'inbox')))
+        if cached is not None:
+            cached['state'] = None
+        return 'Move not confirmed. Check Trash and refresh (u) before retrying; private diagnostics suppressed.'
+    key = message_cache_key(row)
+    TRASHED_MESSAGES.add(key)
+    SEEN_STATES.pop(key, None)
+    with MESSAGE_CACHE_LOCK:
+        MESSAGE_CACHE.pop(key, None)
+    cached = FOLDER_CACHE.get((row['account'], row.get('mailbox', 'inbox')))
+    if cached is not None:
+        cached['state'] = None
+        cached['rows'] = without_trashed(cached['rows'])
+    write_header_cache()
+    start_refresh()
+    return 'Moved to Trash. You can restore it from Trash in Thunderbird or webmail.'
 
 
 def conversations(rows: list[dict]) -> list[list[dict]]:
@@ -977,7 +1068,7 @@ def read_raw(row: dict) -> str:
         # RAM only: include normal PDF attachments, but cap both item and total
         # encoded size. UIDVALIDITY/Message-ID prevent reuse after a UID reset.
         with MESSAGE_CACHE_LOCK:
-            if len(raw.encode('utf-8')) <= 32 * 1024 * 1024:
+            if key not in TRASHED_MESSAGES and len(raw.encode('utf-8')) <= 32 * 1024 * 1024:
                 MESSAGE_CACHE[key] = raw
                 while len(MESSAGE_CACHE) > 16 or sum(len(value.encode('utf-8')) for value in MESSAGE_CACHE.values()) > MESSAGE_CACHE_LIMIT:
                     MESSAGE_CACHE.popitem(last=False)
@@ -1050,12 +1141,16 @@ def show_message(screen: curses.window, row: dict) -> None:
         raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
     status = mark_seen([row], True)
     while True:
-        key = text_view(screen, text, 'r reply | R reply all | * read/unread | a attachments | / search | q back',
-                        {'r', 'R', '*', 'a', 'q'}, status)
+        key = text_view(screen, text, 'r/R reply/all | * read/unread | x trash | a attachments | / search | q back',
+                        {'r', 'R', '*', 'x', 'a', 'q'}, status)
         if key == 'q':
             return
         if key == '*':
             status = mark_seen([row], is_unread(row))
+        elif key == 'x':
+            status = trash_message(screen, row)
+            if message_cache_key(row) in TRASHED_MESSAGES:
+                return
         else:
             status = show_attachments(screen, raw) if key == 'a' else compose(screen, row, reply_all=key == 'R')
 
@@ -1805,12 +1900,16 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
     while True:
         status = poll_seen_changes(status)
         anchor = set()
+        if TRASHED_MESSAGES:
+            rows[:] = without_trashed(rows)
+            if catalog is not rows:
+                catalog[:] = without_trashed(catalog)
         refresh, seen_states = take_refresh()
         if refresh is not None:
             if 0 <= selected < len(filtered):
                 anchor = {row_anchor(row) for row in filtered[selected]}
             try:
-                fresh = refresh.result()
+                fresh = without_trashed(refresh.result())
                 for key, state in seen_states.items():
                     if SEEN_STATES.get(key) is state:
                         del SEEN_STATES[key]
@@ -1822,7 +1921,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                                   if any(row_anchor(row) in old_thread for row in group)), [])
                     fresh.sort(key=message_date)
                 rows[:] = fresh
-                if not status.startswith('Could not save read status'):
+                if not status.startswith(('Could not save read status', 'Move not confirmed')):
                     status = 'Refreshed.'
             except Exception:
                 status = 'Refresh failed; showing previous headers. Press u to retry.'
@@ -1849,7 +1948,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         timer = ' | auto-refresh 5m' if AUTO_REFRESH_ENABLED else ''
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread{timer}', curses.A_BOLD)
-        put_line(screen, 1, 'Arrows/wheel scroll | Enter open | * read/unread | r/R reply/all | / filter | q back')
+        put_line(screen, 1, 'Arrows/wheel | Enter open | * read/unread | x trash | r/R reply/all | / filter | q back')
         put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
@@ -1913,6 +2012,10 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         elif key == '*' and filtered:
             group = filtered[selected]
             status = mark_seen(group, any(is_unread(row) for row in group))
+        elif key == 'x' and filtered:
+            group = sorted(filtered[selected], key=message_date)
+            choice = choose(screen, 'Choose ONE message to move to Trash', [entry_line([row]) for row in group]) if len(group) > 1 else 0
+            status = trash_message(screen, group[choice]) if choice is not None else 'Cancelled; nothing moved.'
         elif key in ('r', 'R', 'c', 'd'):
             try:
                 if key == 'c':
@@ -1962,6 +2065,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                     browse(screen, sorted(group, key=message_date), 'Conversation', False, True, catalog)
                 else:
                     show_message(screen, group[0])
+                    if message_cache_key(group[0]) in TRASHED_MESSAGES:
+                        status = 'Moved to Trash. You can restore it from Trash in Thunderbird or webmail.'
             except RuntimeError as error:
                 status = str(error)
 
@@ -2011,6 +2116,7 @@ def read_settings(path: str | None, cache: bool = False) -> None:
     FOLDER_CACHE.clear()
     SEEN_STATES.clear()
     SEEN_QUEUE.clear()
+    TRASHED_MESSAGES.clear()
     REFRESH_SEEN_STATES.clear()
     HEADER_CACHE_PATH = None
     HEADER_CACHE_READY = False

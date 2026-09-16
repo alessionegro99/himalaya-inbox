@@ -30,14 +30,23 @@ def child() -> None:
         body = '\n'.join(f'SYNTHETIC_BODY_{account}_{args[-1]}_LINE_{i:03d}' for i in range(90))
         message = EmailMessage()
         message['Subject'] = 'Synthetic test'
+        source = next(item for item in rows if item['account'] == account and item['id'] == args[-1])
+        message['Message-ID'] = '<' + source['message-id'] + '>'
         message.set_content(body)
         message.add_attachment(b'SYNTHETIC_ATTACHMENT', maintype='application', subtype='pdf', filename='terminal file.pdf')
         return {'message': message.as_string()}
 
     inbox.run_himalaya = fake_read
+    inbox.SETTINGS = {account: {'imap': {}, 'mailbox': {'alias': {'trash': 'Trash'}}} for account in ('test', 'other')}
+    inbox.start_refresh = lambda: None  # All network operations in this PTY are synthetic.
     flag_calls = []
+    move_calls = []
 
     def fake_flags(args, data=None):
+        if args[2:4] == ['message', 'move']:
+            assert args[4:8] == ['--from', 'inbox', '--to', 'Trash']
+            move_calls.append(args)
+            return b''
         assert args[2:4] in (['flag', 'add'], ['flag', 'remove'])
         assert args[4:8] == ['--mailbox', 'inbox', '--flag', 'seen']
         flag_calls.append(args)
@@ -57,6 +66,8 @@ def child() -> None:
         assert [(args[1], args[3], args[-1]) for args in flag_calls] == [
             ('test', 'add', '1'), ('test', 'remove', '1'),
             ('test', 'add', '1'), ('other', 'add', '2')]
+        assert [(args[1], args[-1]) for args in move_calls] == [('other', '2'), ('test', '1')]
+        assert [(item['account'], item['id']) for item in rows] == [('test', '2')]
 
 
 pid, master = pty.fork()
@@ -112,10 +123,20 @@ try:
     expect(b'Conversation:')
     os.write(master, b'j\r')
     expect(b'SYNTHETIC_BODY_other_2_LINE_000')
-    os.write(master, b'q')
+    os.write(master, b'x')
+    expect(b'Move this message to Trash?')
+    os.write(master, b'n')
+    expect(b'SYNTHETIC_BODY_other_2_LINE_000')
+    os.write(master, b'x')
+    expect(b'Move this message to Trash?')
+    os.write(master, b'y')
     expect(b'Conversation:')
     os.write(master, b'q')
     expect(b'Unified inbox')
+    os.write(master, b'gx')
+    expect(b'Move this message to Trash?')
+    os.write(master, b'y')
+    expect(b'Moved to Trash.')
     # A resize must not lose the selection or break rendering.
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 18, 90, 0, 0))
     os.kill(pid, signal.SIGWINCH)
@@ -131,7 +152,7 @@ try:
         select.select([master], [], [], 0.05)
     attrs = termios.tcgetattr(master)
     assert attrs[3] & termios.ECHO and attrs[3] & termios.ICANON
-    print('PASS: real terminal navigation, thread opening, reader search/scroll, resize, and terminal restoration.')
+    print('PASS: real terminal navigation, reader search/scroll, Trash confirmation/cancellation, resize, and terminal restoration.')
 except BaseException:
     try:
         os.kill(pid, signal.SIGTERM)
