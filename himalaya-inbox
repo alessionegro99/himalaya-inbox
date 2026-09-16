@@ -62,6 +62,9 @@ HEADER_CACHE_READY = False
 HEADER_CACHE_LOCK = Lock()
 REFRESH_JOB: Future | None = None
 REFRESH_SEEN_STATES: dict = {}
+REFRESH_LOCK = Lock()
+AUTO_REFRESH_INTERVAL = 5 * 60
+AUTO_REFRESH_ENABLED = False
 SEEN_STATES: dict[tuple, dict] = {}
 SEEN_QUEUE: deque = deque()
 PREFETCH_ENABLED = False
@@ -664,10 +667,35 @@ def poll_seen_changes(status: str = '') -> str:
 
 
 def start_refresh() -> None:
-    """Remember which saved read states can safely yield to the new snapshot."""
+    """Start at most one refresh; a completed, unseen snapshot may be replaced."""
     global REFRESH_JOB, REFRESH_SEEN_STATES
-    REFRESH_SEEN_STATES = {key: state for key, state in SEEN_STATES.items() if not state['pending']}
-    REFRESH_JOB = background(load_all)
+    with REFRESH_LOCK:
+        if IO_STOP.is_set() or (REFRESH_JOB is not None and not REFRESH_JOB.done()):
+            return
+        # The timer can run while the UI changes read state. Copy the mapping,
+        # but keep record identities so applying an older refresh cannot retire
+        # a newer user action. Never touch curses or the current view here.
+        REFRESH_SEEN_STATES = {key: state for key, state in SEEN_STATES.copy().items() if not state['pending']}
+        REFRESH_JOB = background(load_all)
+
+
+def take_refresh() -> tuple[Future | None, dict]:
+    """Hand one completed snapshot and its matching read-state records to the UI."""
+    global REFRESH_JOB, REFRESH_SEEN_STATES
+    with REFRESH_LOCK:
+        if REFRESH_JOB is None or not REFRESH_JOB.done():
+            return None, {}
+        job, states = REFRESH_JOB, REFRESH_SEEN_STATES
+        REFRESH_JOB, REFRESH_SEEN_STATES = None, {}
+        return job, states
+
+
+def auto_refresh() -> None:
+    """Refresh while this client is open, including during reading and editing."""
+    # Event.wait uses a relative timeout, not the wall clock, and wakes promptly
+    # on exit. Failed/offline requests are retried on the next interval only.
+    while not IO_STOP.wait(AUTO_REFRESH_INTERVAL):
+        start_refresh()
 
 
 def wait_seen_changes(screen: curses.window) -> str:
@@ -1761,7 +1789,6 @@ def entry_line(group: list[dict]) -> str:
 def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox',
            threaded: bool = True, in_thread: bool = False, catalog: list[dict] | None = None) -> None:
     """Browse headers with keys or mouse; Enter opens a thread or its message."""
-    global REFRESH_JOB
     screen.keypad(True)
     try:
         curses.curs_set(0)
@@ -1778,12 +1805,13 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
     while True:
         status = poll_seen_changes(status)
         anchor = set()
-        if REFRESH_JOB is not None and REFRESH_JOB.done():
+        refresh, seen_states = take_refresh()
+        if refresh is not None:
             if 0 <= selected < len(filtered):
                 anchor = {row_anchor(row) for row in filtered[selected]}
             try:
-                fresh = REFRESH_JOB.result()
-                for key, state in REFRESH_SEEN_STATES.items():
+                fresh = refresh.result()
+                for key, state in seen_states.items():
                     if SEEN_STATES.get(key) is state:
                         del SEEN_STATES[key]
                 write_header_cache()
@@ -1798,8 +1826,6 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                     status = 'Refreshed.'
             except Exception:
                 status = 'Refresh failed; showing previous headers. Press u to retry.'
-            REFRESH_JOB = None
-            REFRESH_SEEN_STATES.clear()
         entries = conversations(rows) if threaded else [[row] for row in rows]
         if not in_thread and view != 'all':
             entries = [group for group in entries if any(
@@ -1821,7 +1847,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         screen.erase()
         mode = 'conversations' if threaded else 'messages'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
-        put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread', curses.A_BOLD)
+        timer = ' | auto-refresh 5m' if AUTO_REFRESH_ENABLED else ''
+        put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread{timer}', curses.A_BOLD)
         put_line(screen, 1, 'Arrows/wheel scroll | Enter open | * read/unread | r/R reply/all | / filter | q back')
         put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
@@ -1838,10 +1865,11 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         screen.refresh()
         if PREFETCH_ENABLED and filtered:
             prefetch_message(min(filtered[selected], key=message_date))
-        polling = bool(SEEN_QUEUE) or REFRESH_JOB is not None or (PREFETCH_ENABLED and PREFETCH_JOB is not None and not PREFETCH_JOB.done())
+        busy = bool(SEEN_QUEUE) or REFRESH_JOB is not None or (PREFETCH_ENABLED and PREFETCH_JOB is not None and not PREFETCH_JOB.done())
+        polling = busy or AUTO_REFRESH_ENABLED
         try:
             if polling:
-                screen.timeout(100)
+                screen.timeout(100 if busy else 1000)
             key = screen.get_wch()
         except curses.error:
             continue
@@ -2000,7 +2028,7 @@ def read_settings(path: str | None, cache: bool = False) -> None:
 
 
 def main() -> None:
-    global PREFETCH_ENABLED, REFRESH_JOB, CONTACTS
+    global PREFETCH_ENABLED, AUTO_REFRESH_ENABLED, CONTACTS
     parser = argparse.ArgumentParser(description='Interactive Himalaya inbox, complete conversations, replies and cancellable scheduled sending.')
     group = parser.add_mutually_exclusive_group()
     group.add_argument('-n', '--limit', type=positive_int, help='plain-list mode: show only the newest N messages in total')
@@ -2026,6 +2054,7 @@ def main() -> None:
             parser.error('-n/--limit applies to --list or piped output; interactive threads load all included folders.')
         read_settings(args.config, cache=True)
         IO_STOP.clear()
+        refresh_timer = None
         try:
             if HEADER_CACHE_READY:
                 rows = deduplicate([dict(row, _cached=True) for item in FOLDER_CACHE.values() for row in item['rows']])
@@ -2035,10 +2064,16 @@ def main() -> None:
                 print('Building the local header index for the first time...', file=sys.stderr, flush=True)
                 rows = load_all()
             PREFETCH_ENABLED = True
+            AUTO_REFRESH_ENABLED = True
+            refresh_timer = Thread(target=auto_refresh, name='inbox-auto-refresh', daemon=True)
+            refresh_timer.start()
             curses.wrapper(browse, rows, 'Unified inbox', not args.flat)
         finally:
             PREFETCH_ENABLED = False
+            AUTO_REFRESH_ENABLED = False
             stop_background()
+            if refresh_timer is not None:
+                refresh_timer.join(timeout=1)
             if SEEN_QUEUE:
                 print('Some read/unread changes may not have saved; reopen and refresh to check.', file=sys.stderr)
         return

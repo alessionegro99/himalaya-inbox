@@ -30,6 +30,7 @@ class ReadStateTests(unittest.TestCase):
     def setUp(self) -> None:
         for name, value in [('SEEN_STATES', {}), ('SEEN_QUEUE', deque()), ('REFRESH_SEEN_STATES', {}),
                             ('REFRESH_JOB', None), ('FOLDER_CACHE', {}), ('HEADER_CACHE_PATH', None),
+                            ('IO_STOP', Event()),
                             ('SETTINGS', {'test': {'imap': {}, 'email': 'test@example.org'}}),
                             ('MESSAGE_CACHE', OrderedDict()), ('MESSAGE_READS', {}),
                             ('PREFETCH_ENABLED', False), ('PREFETCH_JOB', None), ('PREFETCH_KEY', None)]:
