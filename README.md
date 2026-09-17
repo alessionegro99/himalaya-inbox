@@ -56,6 +56,7 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | Key | Action |
 | --- | --- |
 | Arrows, `j`/`k`, mouse wheel | Scroll/select |
+| `3j` / `3k` (or another number) | Move down/up that many entries, or lines inside a message |
 | Page Up/Down, `g`/`G` | Page or jump to beginning/end |
 | Enter | Open a conversation, then a message (marks that message read) |
 | `*` | Toggle read/unread for the selected message/conversation, or the open message |
@@ -74,6 +75,8 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | `q` | Go back or quit |
 
 Within a conversation, messages are oldest first. `You (sent)` identifies sent copies. A reply from a conversation summary targets its latest received message; open the conversation and select another message to reply to that one instead.
+
+Type a number followed by `j` or `k`: `3j` moves down three, `3k` moves up three, and `20j` moves down twenty. This works in the inbox, conversation lists, selection menus, and message reader; Up/Down arrows also accept counts. Movement stops at the beginning/end. The footer shows a pending count; Escape cancels it (and still clears a list filter or closes a menu). Counts apply only to these up/down motions, not to reply, Trash, or other actions. Use `G` to jump straight to the last/newest message in a conversation, then `r` to reply to it.
 
 ### Moving mail to Trash
 

@@ -116,12 +116,13 @@ try:
     expect(b'LINE_070')
     # Curses can update only the changed digits; do not expect full lines to be
     # re-emitted after a scroll. Unit tests check the resulting line positions.
-    os.write(master, b'*gGq')
+    os.write(master, b'3j3k*gGq')
     expect(b'Unified inbox')
     # Down arrow in xterm application mode, then open the conversation.
     os.write(master, b'\x1bOB\r')
     expect(b'Conversation:')
-    os.write(master, b'j\r')
+    # Counts clamp to the two-message thread and reset after each motion.
+    os.write(master, b'3j3kj\r')
     expect(b'SYNTHETIC_BODY_other_2_LINE_000')
     os.write(master, b'x')
     expect(b'Move this message to Trash?')

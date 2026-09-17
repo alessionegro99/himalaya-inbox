@@ -1193,7 +1193,7 @@ def input_line(screen: curses.window, prompt: str) -> str | None:
 def text_view(screen: curses.window, text: str, help_text: str,
               actions: set[str], status: str = '') -> str:
     """Scrollable, searchable text with keyboard/mouse navigation and actions."""
-    offset = 0
+    offset = count = 0
     query = ''
     while True:
         status = poll_seen_changes(status)
@@ -1206,9 +1206,11 @@ def text_view(screen: curses.window, text: str, help_text: str,
         put_line(screen, 0, help_text, curses.A_BOLD)
         for y, line in enumerate(lines[offset:offset + page], 1):
             put_line(screen, y, line)
-        footer = status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | arrows/wheel scroll'
+        footer = status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | j/k, 3j/3k, arrows/wheel scroll'
         if SEEN_QUEUE:
             footer = 'Saving read/unread changes... | ' + footer
+        if count:
+            footer = f'Count: {count} | ' + footer
         put_line(screen, height - 1, footer)
         screen.refresh()
         polling = bool(SEEN_QUEUE)
@@ -1223,10 +1225,17 @@ def text_view(screen: curses.window, text: str, help_text: str,
                 screen.timeout(-1)
         if isinstance(key, str) and key in actions:
             return key
+        if isinstance(key, str) and '0' <= key <= '9':
+            count = min(count * 10 + int(key), sys.maxsize)
+            continue
+        if key == curses.KEY_RESIZE:
+            continue
+        # Consume the prefix once; only navigation uses it, never actions.
+        step, count = count or 1, 0
         if key in ('j', curses.KEY_DOWN):
-            offset += 1
+            offset += step
         elif key in ('k', curses.KEY_UP):
-            offset -= 1
+            offset -= step
         elif key in (' ', '\x06', curses.KEY_NPAGE):
             offset += page
         elif key in ('\x02', curses.KEY_PPAGE):
@@ -1254,7 +1263,7 @@ def text_view(screen: curses.window, text: str, help_text: str,
 
 def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
     """Select a list item without entering a shell command."""
-    index = 0
+    index = count = 0
     while choices:
         screen.erase()
         put_line(screen, 0, title + ' | Enter select | q cancel', curses.A_BOLD)
@@ -1262,17 +1271,26 @@ def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
         top = max(0, index - page + 1)
         for y, item in enumerate(choices[top:top + page], 1):
             put_line(screen, y, item, curses.A_REVERSE if top + y - 1 == index else 0)
-        put_line(screen, screen.getmaxyx()[0] - 1, 'Enter select | q cancel | arrows/wheel scroll')
+        footer = 'Enter select | q cancel | j/k, 3j/3k, arrows/wheel scroll'
+        if count:
+            footer = f'Count: {count} | ' + footer
+        put_line(screen, screen.getmaxyx()[0] - 1, footer)
         screen.refresh()
         key = screen.get_wch()
+        if isinstance(key, str) and '0' <= key <= '9':
+            count = min(count * 10 + int(key), sys.maxsize)
+            continue
+        if key == curses.KEY_RESIZE:
+            continue
+        step, count = count or 1, 0
         if key in ('q', '\x1b'):
             return None
         if key in ('\n', '\r', curses.KEY_ENTER):
             return index
         if key in ('j', curses.KEY_DOWN):
-            index = min(len(choices) - 1, index + 1)
+            index = min(len(choices) - 1, index + step)
         elif key in ('k', curses.KEY_UP):
-            index = max(0, index - 1)
+            index = max(0, index - step)
         elif key in (curses.KEY_NPAGE, ' '):
             index = min(len(choices) - 1, index + page)
         elif key == curses.KEY_PPAGE:
@@ -1892,7 +1910,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
     curses.mousemask(curses.ALL_MOUSE_EVENTS)
     if catalog is None:
         catalog = rows
-    selected = top = 0
+    selected = top = count = 0
     query = status = ''
     editing = False
     view = 'inbox'
@@ -1948,7 +1966,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         timer = ' | auto-refresh 5m' if AUTO_REFRESH_ENABLED else ''
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread{timer}', curses.A_BOLD)
-        put_line(screen, 1, 'Arrows/wheel | Enter open | * read/unread | x trash | r/R reply/all | / filter | q back')
+        put_line(screen, 1, 'j/k, 3j/3k | Enter open | * read/unread | x trash | r/R reply | / filter | q back')
         put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
@@ -1960,6 +1978,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             footer = 'Previous headers; refreshing in background | ' + footer
         if SEEN_QUEUE:
             footer = 'Saving read/unread changes... | ' + footer
+        if count:
+            footer = f'Count: {count} | ' + footer
         put_line(screen, height - 1, footer, curses.A_BOLD)
         screen.refresh()
         if PREFETCH_ENABLED and filtered:
@@ -1986,6 +2006,12 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                 query += key
             selected = top = 0
             continue
+        if isinstance(key, str) and '0' <= key <= '9':
+            count = min(count * 10 + int(key), sys.maxsize)
+            continue
+        if key == curses.KEY_RESIZE:
+            continue
+        step, count = count or 1, 0
         status = ''
         if key in ('q', 'Q'):
             if not in_thread:
@@ -2033,9 +2059,9 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             except (RuntimeError, OSError):
                 status = 'Could not prepare the draft; private diagnostics suppressed.'
         elif key in (curses.KEY_DOWN, 'j'):
-            selected += 1
+            selected += step
         elif key in (curses.KEY_UP, 'k'):
-            selected -= 1
+            selected -= step
         elif key in (curses.KEY_NPAGE, ' ', '\x06'):
             selected += page
         elif key in (curses.KEY_PPAGE, '\x02'):
