@@ -1206,7 +1206,7 @@ def text_view(screen: curses.window, text: str, help_text: str,
         put_line(screen, 0, help_text, curses.A_BOLD)
         for y, line in enumerate(lines[offset:offset + page], 1):
             put_line(screen, y, line)
-        footer = status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | j/k, 3j/3k, arrows/wheel scroll'
+        footer = status or f'Lines {offset + 1}-{min(len(lines), offset + page)}/{len(lines)} | arrows/wheel scroll'
         if SEEN_QUEUE:
             footer = 'Saving read/unread changes... | ' + footer
         if count:
@@ -1271,7 +1271,7 @@ def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
         top = max(0, index - page + 1)
         for y, item in enumerate(choices[top:top + page], 1):
             put_line(screen, y, item, curses.A_REVERSE if top + y - 1 == index else 0)
-        footer = 'Enter select | q cancel | j/k, 3j/3k, arrows/wheel scroll'
+        footer = 'Enter select | q cancel | arrows/wheel scroll'
         if count:
             footer = f'Count: {count} | ' + footer
         put_line(screen, screen.getmaxyx()[0] - 1, footer)
@@ -1966,7 +1966,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         timer = ' | auto-refresh 5m' if AUTO_REFRESH_ENABLED else ''
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread{timer}', curses.A_BOLD)
-        put_line(screen, 1, 'j/k, 3j/3k | Enter open | * read/unread | x trash | r/R reply | / filter | q back')
+        put_line(screen, 1, 'Enter open | * read/unread | x trash | r/R reply | / filter | q back')
         put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
