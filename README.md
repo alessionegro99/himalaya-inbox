@@ -97,7 +97,9 @@ This uses Himalaya's `message move`, never permanent deletion or expunge. Restor
 
 The account is selected from the original message, and the configured email is used for the From address. Reply-To is honored. Reply-all removes your configured addresses and never copies Bcc recipients. Reply ancestry is retained.
 
-The editor is explicitly `nvim`, regardless of `$EDITOR` or `$VISUAL`. It runs without your plugins, modelines, swap, undo history, or shada to avoid executing anything in quoted email or copying drafts into editor caches. The only added editor configuration is the wrapper's recipient completion; your normal Neovim configuration is not changed.
+The editor is explicitly `nvim`, regardless of `$EDITOR` or `$VISUAL`. It runs without your plugins, modelines, swap, undo history, or shada to avoid executing anything in quoted email or copying drafts into editor caches. The added editor configuration provides recipient completion and system-clipboard access; your normal Neovim configuration is not changed.
+
+To copy from the email editor, use `yy` for a line, `3yy` for three lines, or select text with `v`/`V` and press `y`. Paste into another terminal with `Ctrl+Shift+V`, or into a desktop app with `Ctrl+V`. This uses Neovim's [built-in clipboard integration](https://neovim.io/doc/user/provider/#provider-clipboard) (`unnamedplus`) and its automatically selected clipboard tool, such as `xclip` on X11 or `wl-copy`/`wl-paste` on Wayland. Cuts also use the clipboard, and `p` pastes from it. Copied/cut text may be retained by your desktop clipboard history; the editor's other privacy protections remain enabled.
 
 ### New messages and recipient suggestions
 

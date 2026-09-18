@@ -1680,6 +1680,10 @@ def send_confirmed(account: str, message: EmailMessage) -> str:
 # Built-in completion and its automatic trigger follow Neovim's documentation:
 # https://github.com/neovim/neovim/blob/v0.11.5/runtime/doc/insert.txt
 EDITOR_LUA = r'''
+-- Keep ordinary yanks/cuts available outside this isolated editor.
+-- https://neovim.io/doc/user/provider/#provider-clipboard
+vim.opt.clipboard:append('unnamedplus')
+
 local contacts = vim.json.decode(table.concat(vim.fn.readfile(vim.env.HIMALAYA_INBOX_CONTACTS), '\n'))
 for _, contact in ipairs(contacts) do
   contact.search = vim.fn.tolower(contact.name .. ' ' .. contact.email)
