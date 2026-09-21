@@ -84,7 +84,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(inbox.REFERENCE_CACHE, {('one', 'new'): ('root',)})
         self.assertFalse(inbox.is_unread(next(r for r in rows if r['id'] == '1')))
 
-    def test_two_folders_are_loaded_concurrently_and_excluded_folders_skipped(self) -> None:
+    def test_folders_load_concurrently_including_trash_but_excluding_drafts(self) -> None:
         barrier = Barrier(2)
 
         def fetch(account, limit, mailbox):
@@ -95,6 +95,7 @@ class CacheTests(unittest.TestCase):
             {'name': 'INBOX', 'attributes': [], 'delimiter': '/'},
             {'name': 'Sent', 'attributes': ['\\Sent'], 'delimiter': '/'},
             {'name': 'Trash', 'attributes': ['\\Trash'], 'delimiter': '/'},
+            {'name': 'Archive', 'attributes': ['\\Archive'], 'delimiter': '/'},
             {'name': 'Drafts', 'attributes': ['\\Drafts'], 'delimiter': '/'},
         ]
         with patch.object(inbox, 'SETTINGS', {'one': {'imap': {}}}), \
@@ -103,9 +104,11 @@ class CacheTests(unittest.TestCase):
                 patch.object(inbox, 'fetch', side_effect=fetch) as fetch_mock, \
                 patch.object(inbox, 'add_references'):
             rows = inbox.load_account('one')
-        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertEqual(fetch_mock.call_count, 4)
         self.assertTrue(rows[0]['in_inbox'])
         self.assertTrue(rows[1]['sent'])
+        self.assertTrue(rows[2]['in_trash'])
+        self.assertTrue(rows[3]['in_archive'])
 
 
 if __name__ == '__main__':

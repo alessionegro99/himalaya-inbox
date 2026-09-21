@@ -2,11 +2,12 @@
 
 My personal interactive setup for the original [Himalaya](https://github.com/pimalaya/himalaya) email CLI, shared so others can adapt it.
 
-This is an independent **companion wrapper**, not a fork or an official part of Himalaya. It uses Himalaya for account access and sending; it does not modify the upstream program. No personal account configuration, email, draft, password, or token is included here.
+This is an independent **companion wrapper**, not a fork or an official part of Himalaya. It uses Himalaya for fetching and sending, with a small direct-IMAP path for safe moves and permanent deletion; it does not modify the upstream program. No personal account configuration, email, draft, password, or token is included here.
 
 ## What it does
 
 - Combines configured accounts into one interactive inbox.
+- Provides unified Trash and Archive views, archiving, restoration to Inbox, and confirmed single-message permanent deletion from Trash.
 - Groups conversations using `Message-ID`, `In-Reply-To`, and the full `References` ancestry, not subject matching.
 - Includes your own sent replies and archived/filed messages in threads, oldest first.
 - Reads plain text or extracts text from HTML without loading remote images or scripts.
@@ -19,12 +20,13 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Offers a custom delay or an explicit send-now confirmation.
 - Keeps unfinished drafts locally so you can resume them.
 
-The inbox is still the starting view: a thread appears there if it contains an Inbox message. Sent-only and archived conversations are available in the Sent and All views. Drafts, Trash, and Junk folders are excluded from the conversation index. Unrelated messages with identical subjects are not merged; missing or malformed threading headers can still leave messages separate.
+The inbox is still the starting view: a thread appears there if it contains an Inbox message. Sent and Archive have their own views; All combines regular indexed mail. Trash is indexed separately and never mixed into those views or their threads. Drafts and Junk are excluded. Unrelated messages with identical subjects are not merged; missing or malformed threading headers can still leave messages separate.
 
 ## Requirements and installation
 
 - Himalaya **2.1.x**, already configured with working incoming and outgoing authentication.
 - IMAP accounts. Other Himalaya backends are not currently supported by full-conversation browsing.
+- Moves/deletion additionally require `imaps://` with standard verified TLS and command-based `sasl.plain.password` or `sasl.xoauth2.token` credentials in the same configuration. Unsupported connection/authentication settings fail safely; browsing and sending still use Himalaya. Servers without `MOVE` need `UIDPLUS` for the safe move fallback; permanent deletion always requires `UIDPLUS`.
 - Linux/Unix terminal, Python 3.12+ with curses, [uv](https://docs.astral.sh/uv/), and Neovim 0.11+.
 - Optional Linux desktop tools: `gio` (GLib) for opening downloaded files, and `xdg-user-dir` for finding your configured Downloads folder. Saving works without these tools.
 
@@ -39,7 +41,7 @@ Ensure `~/.local/bin` is on your PATH. The script uses `uv` to run Python withou
 
 It reads your existing configuration from `$HIMALAYA_CONFIG`, or `$XDG_CONFIG_HOME/himalaya/config.toml` (default `~/.config/himalaya/config.toml`). Use `--config /path/to/config.toml` for a different **single** configuration file. Split/merged config paths are not supported. `HIMALAYA_BIN` can select a different Himalaya executable.
 
-Configure the `inbox`, `sent`, `drafts`, and `trash` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Trash/Junk and their configured equivalents. The first launch builds a private local header index. Later launches show that index immediately while checking for new mail; the footer identifies the previous headers until synchronization completes. Press `u` to refresh in the background without blocking navigation. Failed refreshes retain the previous view and show a warning.
+Configure the `inbox`, `sent`, `drafts`, `trash`, and `archive` mailbox aliases in your own Himalaya config. The wrapper reads all selectable mail folders except Drafts/Junk and their configured equivalents. The first launch builds a private local header index. Later launches show that index immediately while checking for new mail; the footer identifies the previous headers until synchronization completes. Press `u` to refresh in the background without blocking navigation. Failed refreshes retain the previous view and show a warning.
 
 While the interactive inbox is open, it automatically refreshes every five minutes, including while you read a message or compose in Neovim. It preserves the selection, filter and conversation view; the current message/editor is not interrupted, and the updated list appears when you return. Manual `u` refresh remains available. Slow refreshes never overlap; offline failures retry at the next interval. The timer stops on exit and does not run for piped/`--list` output or background sending.
 
@@ -61,6 +63,10 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | Enter | Open a conversation, then a message (marks that message read) |
 | `*` | Toggle read/unread for the selected message/conversation, or the open message |
 | `x` in the message list or reader | Move one message to Trash, after confirmation |
+| `e` in the message list or reader | Archive one message, after confirmation |
+| `T` / `A` in the list | Unified Trash / Archive across accounts |
+| `I` in Trash | Restore one message to its account's Inbox |
+| `X` in Trash | Permanently delete one message: confirm and type `DELETE` |
 | `r` / `R` | Reply / reply to all |
 | `c` | Compose a new message; choose the sending account |
 | `d` | Resume a local draft |
@@ -78,11 +84,17 @@ Within a conversation, messages are oldest first. `You (sent)` identifies sent c
 
 Type a number followed by `j` or `k`: `3j` moves down three, `3k` moves up three, and `20j` moves down twenty. This works in the inbox, conversation lists, selection menus, and message reader; Up/Down arrows also accept counts. Movement stops at the beginning/end. The footer shows a pending count; Escape cancels it (and still clears a list filter or closes a menu). Counts apply only to these up/down motions, not to reply, Trash, or other actions. Use `G` to jump straight to the last/newest message in a conversation, then `r` to reply to it.
 
-### Moving mail to Trash
+### Trash, Archive, and permanent deletion
 
 Select a message and press `x`, or press `x` while reading it. Review the subject, account and destination, then press `y` to move it to that account's configured Trash folder. Press `n`, Escape or `q` to cancel. On a conversation summary, first choose **one** message; the rest of the conversation, including your replies, is left alone. The `d` key still opens drafts.
 
-This uses Himalaya's `message move`, never permanent deletion or expunge. Restore a message from the account's Trash folder in Thunderbird or webmail, subject to the provider's retention policy. A failed or interrupted move is not retried automatically: check Trash and press `u` before trying again. Successfully moved messages are removed from the view and local header/body caches; an older in-flight refresh cannot put the old message back. Tests use synthetic mail and do not move real emails.
+Press `T` in the list to browse all accounts' Trash folders. Select a message and press `I` to restore it to that account's Inbox. Press `X`, confirm with `y`, then type exactly `DELETE` to permanently remove that one message. Cancellation makes no server changes. There is no bulk-empty-Trash command, and permanent deletion cannot be invoked outside Trash. Provider retention rules still apply.
+
+Press `e` in the list or reader to archive one message; press `A` in the list to browse Archive. This uses each account's configured `archive` folder, including its indexed subfolders. For Gmail, the alias should point to All Mail: Inbox copies are excluded from Archive, but non-Inbox sent messages may appear there too. Conversations still include their indexed replies in chronological order.
+
+Moves use one verified-TLS IMAP connection for authentication, source-folder UID-validity and Message-ID checks, and the operation. Servers advertising `MOVE` use `UID MOVE`. Otherwise, the client confirms `UID COPY` and its exact `COPYUID` receipt **before** flagging the original and issuing `UID EXPUNGE` for only that UID. A failed copy never removes the original. Permanent deletion also uses only `UID EXPUNGE`; the client never issues a mailbox-wide `EXPUNGE` or `CLOSE`. See [RFC 6851](https://www.rfc-editor.org/rfc/rfc6851) and [RFC 4315](https://www.rfc-editor.org/rfc/rfc4315).
+
+After success, the old UID is removed from the local views/caches and only the affected account refreshes in the background. A move during an existing refresh schedules a follow-up read, not another move. Network confirmation can still take a few seconds. An error identifies whether verification failed, a copy was confirmed but removal was uncertain, or the move/deletion was not confirmed. Raw server/helper diagnostics remain private. **Check the relevant folders and refresh before retrying an uncertain action.** Tests use synthetic mail and do not move or delete real emails.
 
 ### Replying
 
@@ -171,7 +183,7 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 
 ## Privacy and sending safety
 
-- Authentication stays with Himalaya and its configured helpers. This wrapper does not print their raw output, errors, or credentials.
+- Himalaya handles fetching/sending/read-flag authentication. The direct-IMAP move/deletion path reuses the same configured credential commands; their output is captured privately, used in memory over certificate-verified TLS, and never printed, logged, or stored in the header cache. It does not create a second credentials store.
 - Header browsing and preloading use read-only/peek fetching. Opening a message marks it read; `*` changes read/unread explicitly. Only the Seen flag is changed; other flags are preserved. These changes synchronize through your mail server to other clients.
 - Headers (including subjects and From/To addresses) are cached as **plaintext** under `$XDG_CACHE_HOME/himalaya-inbox` (default `~/.cache/himalaya-inbox`), with directory permissions 700 and file permissions 600. This cache contains no message bodies, Bcc fields, passwords, OAuth tokens, or account configuration. It is isolated by a hash of the configuration and written atomically. Removing this directory forces a full header reload next time.
 - Message bodies are fetched when highlighted, opened, or used to prepare a reply, without marking messages read. The RAM cache retains at most 16 messages, at most 32 MiB each and 64 MiB combined in UTF-8 encoding, until exit. Refresh preserves only bodies whose account/folder/UID validity/UID/Message-ID still match. Larger messages are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
@@ -192,12 +204,14 @@ Do not commit your live Himalaya configuration, OAuth data, mail, logs, or draft
 uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
-Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, automatic read marking, read/unread toggles and ordered saves, refresh races and failed-save rollback, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Sending, read/unread writes and attachment viewers are mocked; no real messages are sent or marked by the tests.
+Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, automatic read marking, read/unread toggles and ordered saves, refresh races and failed-save rollback, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Folder tests cover unified Trash/Archive, Gmail label deduplication, source identity checks, copy-before-removal ordering, UID-scoped expunge, failure suppression, and exact permanent-delete confirmation. All network mutations, credential helpers, and attachment viewers are mocked; no real messages are sent, moved, deleted, or marked by the tests.
 
 ## Scope and upstream credit
 
-This is a small personal interface, not a full replacement for Thunderbird. Encryption/signing, remote draft synchronization, server-side deletion, and persistent/offline message-body storage are not implemented. Cached headers can be browsed offline; opening an uncached body still needs the server. Only one configuration file is supported.
+This is a small personal interface, not a full replacement for Thunderbird. Encryption/signing, remote draft synchronization, and persistent/offline message-body storage are not implemented. Cached headers can be browsed offline; opening an uncached body still needs the server. Only one configuration file is supported.
 
-The transport/backend work is provided by [Pimalaya's Himalaya](https://github.com/pimalaya/himalaya). Thread identifiers follow [RFC 5322 §3.6.4](https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4); header-only fetching follows [IMAP RFC 3501](https://www.rfc-editor.org/rfc/rfc3501). Python's standard-library `email` and `curses` modules provide MIME handling and the terminal interface.
+Himalaya remains a required backend: it handles folder/envelope discovery, message bodies, read/unread flags, sending, and saving Sent copies. This wrapper owns the UI, conversation grouping, caches, editor integration, attachments, and outbox scheduling. Moves and permanent deletion use Python's standard-library `imaplib` because they need a conditional, single-session transaction that Himalaya's individual CLI calls do not provide. Replacing Himalaya entirely would require replacing the other backend operations too; this is not a standalone replacement.
+
+The main transport/backend work is provided by [Pimalaya's Himalaya](https://github.com/pimalaya/himalaya). Thread identifiers follow [RFC 5322 §3.6.4](https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4); header-only fetching follows [IMAP RFC 3501](https://www.rfc-editor.org/rfc/rfc3501). Python's standard-library `email`, `imaplib`, and `curses` modules provide MIME handling, safe folder transactions, and the terminal interface.
 
 The wrapper is MIT-licensed; upstream projects retain their own licenses. Contributions that keep the code small, testable, and safe are welcome.

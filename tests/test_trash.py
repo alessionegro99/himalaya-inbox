@@ -1,6 +1,7 @@
 """Trash moves are confirmed, scoped and recoverable; never touch live mail."""
 
 from collections import OrderedDict, deque
+from contextlib import nullcontext
 from concurrent.futures import Future
 import curses
 import json
@@ -11,6 +12,9 @@ import unittest
 from unittest.mock import patch
 
 from test_inbox import FakeScreen, inbox, row
+from test_mail_actions import FakeIMAP
+
+TRANSFER_MESSAGE = inbox.transfer_message
 
 
 def message(uid: str = '1', **values) -> dict:
@@ -30,7 +34,7 @@ class TrashTests(unittest.TestCase):
             override = patch.object(inbox, name, value)
             override.start()
             self.addCleanup(override.stop)
-        self.transport_patch = patch.object(inbox, 'run_private', return_value=b'')
+        self.transport_patch = patch.object(inbox, 'transfer_message', return_value={'gmail': False})
         self.transport = self.transport_patch.start()
         self.addCleanup(self.transport_patch.stop)
         refresh_patch = patch.object(inbox, 'start_refresh')
@@ -48,9 +52,7 @@ class TrashTests(unittest.TestCase):
     def test_move_command_uses_exact_account_folder_uid_and_configured_trash(self) -> None:
         item = dict(message('42'), account='other', mailbox='Archive')
         inbox.move_to_trash(item, 'Deleted Items')
-        self.transport.assert_called_once_with([
-            '--account', 'other', 'message', 'move', '--from', 'Archive', '--to', 'Deleted Items', '--', '42'])
-        self.states.assert_called_once_with('other', ['Archive'])
+        self.transport.assert_called_once_with(item, 'Deleted Items')
 
     def test_missing_or_unsafe_trash_alias_fails_without_a_move(self) -> None:
         for destination in [None, '', ' ', 'Trash\nINBOX']:
@@ -114,29 +116,35 @@ class TrashTests(unittest.TestCase):
         self.transport.assert_called_once()
 
     def test_changed_uid_epoch_never_moves_a_different_message(self) -> None:
-        self.states.return_value = {'INBOX': {'UIDVALIDITY': 11}}
-        status = inbox.trash_message(FakeScreen(['y']), message())
-        self.assertIn('Move not confirmed', status)
-        self.transport.assert_not_called()
+        client = FakeIMAP()
+        client.epoch = 11
+        self.transport.side_effect = TRANSFER_MESSAGE
+        with patch.object(inbox, 'action_connection', return_value=nullcontext(client)):
+            status = inbox.trash_message(FakeScreen(['y']), message())
+        self.assertIn('Mailbox identity changed', status)
+        client.uid.assert_not_called()
         self.assertFalse(inbox.TRASHED_MESSAGES)
 
     def test_missing_epoch_requires_a_fresh_matching_message_id(self) -> None:
         item = dict(message(), uidvalidity=None)
         inbox.MESSAGE_CACHE[inbox.message_cache_key(item)] = 'Message-ID: <message-1>\n\nOLD'
-        with patch.object(inbox, 'run_himalaya', return_value={'message': 'Message-ID: <wrong>\n\nNEW'}):
+        client = FakeIMAP()
+        client.mid = 'wrong'
+        self.transport.side_effect = TRANSFER_MESSAGE
+        with patch.object(inbox, 'action_connection', side_effect=lambda _: nullcontext(client)):
             with self.assertRaises(RuntimeError):
                 inbox.move_to_trash(item, 'Trash')
-        self.transport.assert_not_called()
-        with patch.object(inbox, 'run_himalaya', return_value={'message': 'Message-ID: <message-1>\n\nBODY'}):
+            self.assertEqual([call.args[0] for call in client.uid.call_args_list], ['FETCH'])
+            client.mid = 'message-1'
             inbox.move_to_trash(item, 'Trash')
-        self.transport.assert_called_once()
+        self.assertEqual(client.uid.call_args.args, ('MOVE', '1', '"Trash"'))
 
     def test_unverifiable_message_and_uid_ranges_cannot_move(self) -> None:
         cases = [dict(message(), uidvalidity=None, **{'message-id': None}),
                  message('0'), message('*'), message('1:99'), message('--all')]
         for item in cases:
             with self.assertRaises(RuntimeError):
-                inbox.move_to_trash(item, 'Trash')
+                TRANSFER_MESSAGE(item, 'Trash')
         self.transport.assert_not_called()
 
     def test_failed_or_interrupted_move_keeps_message_and_never_retries(self) -> None:
@@ -169,10 +177,10 @@ class TrashTests(unittest.TestCase):
                 raise curses.error()
             return value
 
-        def move(args):
+        def move(row, destination):
             self.assertFalse(inbox.SEEN_QUEUE)
-            self.assertEqual(args[2:4], ['message', 'move'])
-            return b''
+            self.assertEqual(destination, 'Trash')
+            return {'gmail': False}
 
         screen.get_wch = key
         self.transport.side_effect = move
@@ -191,7 +199,7 @@ class TrashTests(unittest.TestCase):
         items = [message('1'), message('2')]
         self.browse(FakeScreen(['j', 'x', 'y', 'q']), items, threaded=False)
         self.assertEqual([item['id'] for item in items], ['1'])
-        self.assertEqual(self.transport.call_args.args[0][-1], '2')
+        self.assertEqual(self.transport.call_args.args[0]['id'], '2')
 
     def test_conversation_summary_requires_choosing_one_message(self) -> None:
         first = message()
@@ -200,8 +208,8 @@ class TrashTests(unittest.TestCase):
         self.browse(FakeScreen(['x', 'j', '\n', 'y', 'q']), items)
         self.assertEqual(items, [first])
         self.transport.assert_called_once()
-        self.assertEqual(self.transport.call_args.args[0][-1], '2')
-        self.assertEqual(self.transport.call_args.args[0][5], 'Sent')
+        self.assertEqual(self.transport.call_args.args[0]['id'], '2')
+        self.assertEqual(self.transport.call_args.args[0]['mailbox'], 'Sent')
 
     def test_cancelling_conversation_selection_preserves_every_message(self) -> None:
         items = [message(), dict(message('2'), **{'in-reply-to': ['message-1']})]

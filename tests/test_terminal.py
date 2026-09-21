@@ -38,15 +38,18 @@ def child() -> None:
 
     inbox.run_himalaya = fake_read
     inbox.SETTINGS = {account: {'imap': {}, 'mailbox': {'alias': {'trash': 'Trash'}}} for account in ('test', 'other')}
-    inbox.start_refresh = lambda: None  # All network operations in this PTY are synthetic.
+    inbox.start_refresh = lambda *args: None  # All network operations in this PTY are synthetic.
     flag_calls = []
     move_calls = []
 
+    def fake_move(item, destination):
+        assert destination == 'Trash'
+        move_calls.append((item['account'], item['id']))
+        return {'gmail': False}
+
+    inbox.transfer_message = fake_move
+
     def fake_flags(args, data=None):
-        if args[2:4] == ['message', 'move']:
-            assert args[4:8] == ['--from', 'inbox', '--to', 'Trash']
-            move_calls.append(args)
-            return b''
         assert args[2:4] in (['flag', 'add'], ['flag', 'remove'])
         assert args[4:8] == ['--mailbox', 'inbox', '--flag', 'seen']
         flag_calls.append(args)
@@ -66,7 +69,7 @@ def child() -> None:
         assert [(args[1], args[3], args[-1]) for args in flag_calls] == [
             ('test', 'add', '1'), ('test', 'remove', '1'),
             ('test', 'add', '1'), ('other', 'add', '2')]
-        assert [(args[1], args[-1]) for args in move_calls] == [('other', '2'), ('test', '1')]
+        assert move_calls == [('other', '2'), ('test', '1')]
         assert [(item['account'], item['id']) for item in rows] == [('test', '2')]
 
 

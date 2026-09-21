@@ -25,6 +25,7 @@ from email.parser import BytesParser, Parser
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid
 from html.parser import HTMLParser
 import hashlib
+import imaplib
 import json
 import mimetypes
 import os
@@ -33,6 +34,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -42,6 +44,7 @@ from threading import Event, Lock, Semaphore, Thread
 import tomllib
 import time
 import uuid
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from collections import OrderedDict, deque
 from collections.abc import Iterator
@@ -62,6 +65,7 @@ HEADER_CACHE_READY = False
 HEADER_CACHE_LOCK = Lock()
 REFRESH_JOB: Future | None = None
 REFRESH_SEEN_STATES: dict = {}
+REFRESH_AGAIN: set[str] = set()
 REFRESH_LOCK = Lock()
 AUTO_REFRESH_INTERVAL = 5 * 60
 AUTO_REFRESH_ENABLED = False
@@ -80,13 +84,18 @@ MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 
 def run_private(args: list[str], data: bytes | None = None) -> bytes:
     """Capture diagnostics privately, including authentication-helper output."""
+    return run_command_private([HIMALAYA, '--log-level', 'off', *CONFIG_ARGS, *args], data)
+
+
+def run_command_private(command: list[str], data: bytes | None = None) -> bytes:
+    """Capture a mail command or credential helper; never inherit its output."""
     process = None
     try:
         with IO_LOCK:
             if IO_STOP.is_set():
                 raise RuntimeError('Mail request cancelled.')
             process = subprocess.Popen(
-                [HIMALAYA, '--log-level', 'off', *CONFIG_ARGS, *args],
+                command,
                 stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
             )
@@ -388,7 +397,7 @@ def _write_header_cache() -> None:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
         fields = {'account', 'mailbox', 'id', 'message-id', 'in-reply-to', 'references', 'from', 'to',
-                  'date', 'flags', 'subject', 'in_inbox', 'sent', 'uidvalidity'}
+                  'date', 'flags', 'subject', 'in_inbox', 'sent', 'in_trash', 'in_archive', 'uidvalidity'}
         folders = []
         for (account, mailbox), item in FOLDER_CACHE.copy().items():
             rows = []
@@ -428,7 +437,7 @@ def load_account(account: str) -> list[dict]:
     settings = SETTINGS[account]
     if 'imap' not in settings:
         raise RuntimeError('Full conversation browsing currently requires IMAP accounts.')
-    aliases = settings.get('mailbox', {}).get('alias', {})
+    aliases = {name.casefold(): value for name, value in settings.get('mailbox', {}).get('alias', {}).items()}
     previous = {mailbox: item for (owner, mailbox), item in FOLDER_CACHE.copy().items() if owner == account}
     # On warm loads, folder discovery and change checks overlap instead of
     # paying for two serial logins. Both requests are read-only.
@@ -436,13 +445,13 @@ def load_account(account: str) -> list[dict]:
         listing = pool.submit(run_himalaya, ['--account', account, 'imap', 'list', '--all'])
         checking = pool.submit(mailbox_states, account, list(previous))
         boxes, states = listing.result()['mailboxes'], checking.result()
-    excluded = {aliases.get(role, '').casefold() for role in ('drafts', 'trash', 'junk', 'spam')}
-    excluded |= {'drafts', 'trash', 'junk', 'spam', 'deleted', 'deleted items', 'cestino', 'bozze'}
+    excluded = {aliases.get(role, '').casefold() for role in ('drafts', 'junk', 'spam')}
+    excluded |= {'drafts', 'junk', 'spam', 'bozze'}
     selected = []
     for box in boxes:
         mailbox = box['name']
         attrs = {a.casefold().lstrip('\\') for a in box['attributes']}
-        if attrs & {'noselect', 'drafts', 'trash', 'junk'}:
+        if attrs & {'noselect', 'drafts', 'junk'}:
             continue
         leaf = mailbox.rsplit('/', 1)[-1].casefold()
         delimiter = box.get('delimiter') or '/'
@@ -473,6 +482,9 @@ def load_account(account: str) -> list[dict]:
         for row in rows:
             row['in_inbox'] = mailbox.casefold() == aliases.get('inbox', 'INBOX').casefold()
             row['sent'] = mailbox == aliases.get('sent') or 'sent' in attrs
+            row['in_trash'] = mailbox == aliases.get('trash') or 'trash' in attrs
+            archive = aliases.get('archive')
+            row['in_archive'] = bool(archive and (mailbox == archive or mailbox.startswith(archive + (box.get('delimiter') or '/')))) or bool(attrs & {'archive', 'all'})
             row['uidvalidity'] = state['UIDVALIDITY'] if state else None
         return mailbox, {'state': state, 'rows': rows}
 
@@ -491,20 +503,28 @@ def deduplicate(rows: list[dict]) -> list[dict]:
     unique = {}
     # Prefer Inbox over Sent over Archive when one message has multiple labels.
     for row in sorted(rows, key=lambda r: (not r.get('in_inbox', False), not r.get('sent', False))):
-        key = (row['account'], normalized_id(row.get('message-id')) or (row.get('mailbox'), str(row['id'])))
+        key = (row['account'], bool(row.get('in_trash')), normalized_id(row.get('message-id')) or (row.get('mailbox'), str(row['id'])))
         if key not in unique:
             unique[key] = dict(row)
         else:
             unique[key]['sent'] = unique[key].get('sent', False) or row.get('sent', False)
+            if 'in_archive' in row or 'in_archive' in unique[key]:
+                unique[key]['in_archive'] = unique[key].get('in_archive', False) or row.get('in_archive', False)
+    for row in unique.values():
+        # Gmail's All Mail also contains Inbox copies; those are not archived.
+        if 'in_archive' in row:
+            row['in_archive'] = row['in_archive'] and not row.get('in_inbox', False)
     return merge([list(unique.values())], None)
 
 
-def load_all() -> list[dict]:
+def load_all(accounts: list[str] | None = None) -> list[dict]:
     """Load accounts in parallel; fail visibly instead of hiding incomplete threads."""
     global CONTACTS, REFERENCE_CACHE, PREFETCH_KEY
-    with ThreadPoolExecutor(max_workers=min(len(SETTINGS), 5)) as pool:
-        rows = deduplicate([row for batch in pool.map(load_account, SETTINGS) for row in batch])
-    rows = without_trashed(rows)
+    selected = list(SETTINGS) if accounts is None else accounts
+    with ThreadPoolExecutor(max_workers=max(1, min(len(selected), 5))) as pool:
+        batches = list(pool.map(load_account, selected))
+    batches.extend(item['rows'] for (owner, _), item in FOLDER_CACHE.copy().items() if owner not in selected)
+    rows = deduplicate(without_trashed([row for batch in batches for row in batch]))
     CONTACTS = collect_contacts(rows)
     # A Message-ID identifies an immutable message (the same identity used by
     # deduplicate). Scope by account, never reuse a bare mailbox UID after reset.
@@ -677,17 +697,25 @@ def poll_seen_changes(status: str = '') -> str:
     return status
 
 
-def start_refresh() -> None:
+def start_refresh(accounts: list[str] | None = None) -> None:
     """Start at most one refresh; a completed, unseen snapshot may be replaced."""
     global REFRESH_JOB, REFRESH_SEEN_STATES
     with REFRESH_LOCK:
-        if IO_STOP.is_set() or (REFRESH_JOB is not None and not REFRESH_JOB.done()):
+        if IO_STOP.is_set():
             return
+        if REFRESH_JOB is not None and not REFRESH_JOB.done():
+            if accounts is not None:
+                REFRESH_AGAIN.update(accounts)
+            return
+        if accounts is not None:
+            accounts = sorted(set(accounts) | REFRESH_AGAIN)
+        REFRESH_AGAIN.clear()
         # The timer can run while the UI changes read state. Copy the mapping,
         # but keep record identities so applying an older refresh cannot retire
         # a newer user action. Never touch curses or the current view here.
-        REFRESH_SEEN_STATES = {key: state for key, state in SEEN_STATES.copy().items() if not state['pending']}
-        REFRESH_JOB = background(load_all)
+        REFRESH_SEEN_STATES = {key: state for key, state in SEEN_STATES.copy().items()
+                              if not state['pending'] and (accounts is None or key[0] in accounts)}
+        REFRESH_JOB = background(load_all) if accounts is None else background(load_all, accounts)
 
 
 def take_refresh() -> tuple[Future | None, dict]:
@@ -698,7 +726,11 @@ def take_refresh() -> tuple[Future | None, dict]:
             return None, {}
         job, states = REFRESH_JOB, REFRESH_SEEN_STATES
         REFRESH_JOB, REFRESH_SEEN_STATES = None, {}
-        return job, states
+        again = sorted(REFRESH_AGAIN)
+        REFRESH_AGAIN.clear()
+    if again:
+        start_refresh(again)
+    return job, states
 
 
 def auto_refresh() -> None:
@@ -756,50 +788,241 @@ def trash_folder(row: dict) -> str:
     return destination
 
 
-def move_to_trash(row: dict, destination: str) -> None:
-    """Move one verified message once; never invoke delete, expunge or retry."""
+class MailActionError(RuntimeError):
+    """A deliberately public explanation, never a raw server/helper exception."""
+
+
+def configured_folder(account: str, role: str) -> str:
+    """Require an explicit destination from the existing Himalaya account map."""
+    aliases = SETTINGS.get(account, {}).get('mailbox', {}).get('alias', {})
+    value = {name.casefold(): value for name, value in aliases.items()}.get(role)
+    if not isinstance(value, str) or not value.strip() or not all(c.isprintable() for c in value):
+        raise MailActionError(f'Configure mailbox.alias.{role} for this account first.')
+    return value
+
+
+def resolved_folder(row: dict) -> str:
+    # Indexed rows contain backend-native LIST names, not logical aliases.
+    # Resolving "Archive" again could silently select a different physical folder.
+    if row.get('mailbox'):
+        return row['mailbox']
+    aliases = SETTINGS.get(row['account'], {}).get('mailbox', {}).get('alias', {})
+    return {name.casefold(): value for name, value in aliases.items()}.get('inbox', 'INBOX')
+
+
+@contextmanager
+def action_connection(account: str) -> Iterator[imaplib.IMAP4_SSL]:
+    """One verified-TLS connection per action, sharing Himalaya's secret helpers.
+
+    https://docs.python.org/3.12/library/imaplib.html#imaplib.IMAP4_SSL
+    https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
+    """
+    client = None
+    try:
+        config = SETTINGS[account]['imap']
+        server = urlsplit(config['server'])
+        if (server.scheme != 'imaps' or not server.hostname or server.username or server.password
+                or server.path not in ('', '/') or server.query or server.fragment
+                or set(config) - {'server', 'sasl'}):
+            raise MailActionError('Moves require an imaps:// account with standard verified TLS settings.')
+        sasl = config['sasl']
+        mechanism = 'xoauth2' if 'xoauth2' in sasl else 'plain'
+        auth = sasl[mechanism]
+        username = auth['username']
+        command = auth['token' if mechanism == 'xoauth2' else 'password']['command']
+        if (not isinstance(username, str) or any(c in username for c in '\x00\x01\r\n')
+                or not isinstance(command, list) or not command
+                or any(not isinstance(part, str) for part in command)):
+            raise MailActionError('Moves require a command-based credential helper in the account configuration.')
+        secret = run_command_private(command).decode('utf-8').rstrip('\r\n')
+        if not secret or any(c in secret for c in '\x00\x01\r\n'):
+            raise MailActionError('The credential helper returned an invalid credential; nothing changed.')
+        client = imaplib.IMAP4_SSL(server.hostname, server.port or 993,
+                                  ssl_context=ssl.create_default_context(), timeout=15)
+        client.debug = 0
+        payload = (f'user={username}\x01auth=Bearer {secret}\x01\x01' if mechanism == 'xoauth2'
+                   else '\x00' + username + '\x00' + secret).encode('utf-8')
+        answered = False
+
+        def answer(challenge: bytes) -> bytes:
+            nonlocal answered
+            # A failure challenge must not cause credentials to be resent.
+            if answered or challenge:
+                return b''
+            answered = True
+            return payload
+
+        client.authenticate(mechanism.upper(), answer)
+        del secret, payload
+    except MailActionError:
+        if client is not None:
+            client.shutdown()
+        raise
+    except BaseException as error:
+        if client is not None:
+            try:
+                client.shutdown()
+            except OSError:
+                pass
+        if not isinstance(error, Exception):
+            raise
+        raise MailActionError('Could not connect or authenticate securely; no message was changed. Check this account in Himalaya.') from None
+    try:
+        yield client
+    finally:
+        # Never CLOSE: it can expunge unrelated messages flagged by another client.
+        try:
+            client.shutdown()
+        except OSError:
+            pass
+
+
+def confirmed_copy_uid(client: imaplib.IMAP4, source_uid: str) -> tuple[int, str] | None:
+    """Accept only the one-message COPYUID receipt for our exact source UID."""
+    _, values = client.response('COPYUID')
+    for value in values or []:
+        if not isinstance(value, bytes):
+            continue
+        match = re.fullmatch(rb'([1-9][0-9]*) ([1-9][0-9]*) ([1-9][0-9]*)', value)
+        if match and int(match[2]) == int(source_uid):
+            return int(match[1]), match[3].decode('ascii')
+    return None
+
+
+def transfer_message(row: dict, destination: str | None) -> dict:
+    """Verify and change one UID on one connection; never retry a mutation.
+
+    MOVE: https://www.rfc-editor.org/rfc/rfc6851#section-3.3
+    Safe COPY/STORE/UID EXPUNGE fallback: https://www.rfc-editor.org/rfc/rfc4315#section-2.1
+    """
+    account, _, uid, validity, mid = message_cache_key(row)
+    source = resolved_folder(row)
+    if not re.fullmatch(r'[1-9][0-9]*', uid) or (validity is None and not mid):
+        raise MailActionError('Message identity is unavailable; refresh before changing this message.')
+    if destination is None and source != configured_folder(account, 'trash'):
+        raise MailActionError('Permanent deletion is only allowed from this account\'s Trash folder.')
+    if destination == source:
+        raise MailActionError('This message is already in the destination folder; nothing changed.')
+    stage = 'Nothing changed: message verification failed. Refresh before retrying.'
+    try:
+        with action_connection(account) as client:
+            kind, capabilities = client.capability()
+            if kind != 'OK':
+                raise MailActionError(stage)
+            caps = set(b' '.join(capabilities).upper().split())
+            if (destination is None or b'MOVE' not in caps) and b'UIDPLUS' not in caps:
+                raise MailActionError('This server lacks UIDPLUS; safe single-message removal is unavailable. Nothing changed.')
+            kind, _ = client.select(imap_mailbox(source))
+            if kind != 'OK':
+                raise MailActionError('Could not open the source folder; nothing changed.')
+            _, epoch = client.response('UIDVALIDITY')
+            current = int(epoch[0]) if epoch and epoch[0] else None
+            if current is None or (validity is not None and current != validity):
+                raise MailActionError('Mailbox identity changed; refresh before changing this message. Nothing changed.')
+            kind, data = client.uid('FETCH', uid, '(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            headers = [part[1] for part in data or [] if isinstance(part, tuple)
+                       and re.search(rb'\bUID ' + uid.encode() + rb'\b', part[0])]
+            if kind != 'OK' or len(headers) != 1:
+                raise MailActionError('This message is no longer in the source folder; refresh. Nothing changed.')
+            actual = BytesParser(policy=policy.default).parsebytes(headers[0], headersonly=True)
+            if mid and normalized_id(actual.get('Message-ID')) != mid:
+                raise MailActionError('Message identity changed; refresh before changing it. Nothing changed.')
+            if IO_STOP.is_set():
+                raise MailActionError('Mail action cancelled before any change.')
+            receipt = None
+            if destination is not None and b'MOVE' in caps:
+                stage = 'Move not confirmed. Check the destination and refresh before retrying.'
+                if client.uid('MOVE', uid, imap_mailbox(destination))[0] != 'OK':
+                    raise MailActionError(stage)
+                receipt = confirmed_copy_uid(client, uid)
+            else:
+                if destination is not None:
+                    stage = 'Copy not confirmed; the source was not removed. Check both folders before retrying.'
+                    if client.uid('COPY', uid, imap_mailbox(destination))[0] != 'OK':
+                        raise MailActionError(stage)
+                    receipt = confirmed_copy_uid(client, uid)
+                    if receipt is None:
+                        raise MailActionError('Copy returned no verifiable destination UID; the source was not removed. Check both folders before retrying.')
+                    stage = 'Copy confirmed, but source removal was not confirmed. Check both folders and refresh before retrying.'
+                else:
+                    stage = 'Permanent deletion not confirmed. Refresh Trash before retrying.'
+                if IO_STOP.is_set():
+                    raise MailActionError(stage)
+                if client.uid('STORE', uid, '+FLAGS.SILENT', r'(\Deleted)')[0] != 'OK':
+                    raise MailActionError(stage)
+                if client.uid('EXPUNGE', uid)[0] != 'OK':
+                    raise MailActionError(stage)
+                kind, remaining = client.uid('SEARCH', None, 'UID', uid)
+                if kind != 'OK' or any(value and value.strip() for value in remaining):
+                    raise MailActionError(stage)
+            return {'copyuid': receipt, 'gmail': b'X-GM-EXT-1' in caps}
+    except MailActionError:
+        raise
+    except Exception:
+        raise MailActionError(stage + ' Private diagnostics suppressed.') from None
+
+
+def move_to_trash(row: dict, destination: str) -> dict:
+    """Move one verified message, using a safe fallback on servers without MOVE."""
     if destination != trash_folder(row):
         raise RuntimeError('Trash destination changed; confirm it again.')
-    # Even without UIDVALIDITY, verify a fresh Message-ID before this move.
-    verify_message_uid(dict(row, _cached=True))
-    run_private(['--account', row['account'], 'message', 'move',
-                 '--from', row.get('mailbox', 'inbox'), '--to', destination, '--', str(row['id'])])
+    return transfer_message(row, destination)
 
 
 def trash_message(screen: curses.window, row: dict) -> str:
-    """Confirm one exact message, move it to Trash, then retire its old UID."""
+    return folder_action(screen, row, 'trash')
+
+
+def folder_action(screen: curses.window, row: dict, role: str) -> str:
+    """Confirm one exact message; permanent deletion is restricted to Trash."""
     try:
-        destination = trash_folder(row)
+        destination = None if role == 'delete' else (trash_folder(row) if role == 'trash' else configured_folder(row['account'], role))
+        if role == 'delete' and resolved_folder(row) != configured_folder(row['account'], 'trash'):
+            return 'Permanent deletion is only available in Trash.'
+        if destination == resolved_folder(row):
+            return 'This message is already in that folder; nothing changed.'
     except RuntimeError as error:
         return str(error)
+    label = {'trash': 'Trash', 'archive': 'Archive', 'inbox': 'Inbox', 'delete': 'permanent deletion'}[role]
     details = '\n'.join([
-        'Move this message to Trash?', '',
+        'Permanently delete this message?' if role == 'delete' else f'Move this message to {label}?', '',
         f'Subject: {clean(row.get("subject") or "(no subject)")}',
         f'From: {clean(row.get("from", []))}',
         f'Account: {clean(row["account"])}',
-        f'Folder: {clean(row.get("mailbox", "inbox"))} -> {clean(destination)}', '',
-        'Only this message will be moved, not the whole conversation.',
-        'Restore it from Trash in Thunderbird or webmail. No permanent deletion.',
+        f'Folder: {clean(row.get("mailbox", "inbox"))} -> {clean(destination) if destination else "PERMANENT DELETION"}', '',
+        'Only this message is affected, not the whole conversation.',
+        'This cannot be undone. No other Trash messages will be deleted.' if role == 'delete'
+        else 'The message is kept in the destination folder. No permanent deletion.',
     ])
-    if text_view(screen, details, 'y move to Trash | n / Esc / q cancel', {'y', 'Y', 'n', 'N', 'q', '\x1b'}) not in ('y', 'Y'):
+    if text_view(screen, details, 'y continue | n / Esc / q cancel', {'y', 'Y', 'n', 'N', 'q', '\x1b'}) not in ('y', 'Y'):
         return 'Cancelled; nothing moved.'
-    status = wait_seen_changes(screen, 'moving to Trash')
+    if role == 'delete' and input_line(screen, 'Type DELETE to permanently delete this ONE message: ') != 'DELETE':
+        return 'Cancelled; nothing deleted.'
+    status = wait_seen_changes(screen, label)
     if status:
-        return status + ' Nothing moved to Trash.'
+        return status + ' Nothing moved or deleted.'
     screen.erase()
-    put_line(screen, 0, 'Moving this message to Trash...')
+    put_line(screen, 0, f'{"Deleting this message permanently" if role == "delete" else "Moving this message to " + label}...')
     screen.refresh()
     try:
-        move_to_trash(row, destination)
-    except (RuntimeError, OSError, ValueError, KeyError, TypeError, KeyboardInterrupt):
-        # An interrupted/failed command can be uncertain: retain the message
-        # locally, force a fresh folder check, and never retry the move for them.
-        cached = FOLDER_CACHE.get((row['account'], row.get('mailbox', 'inbox')))
-        if cached is not None:
-            cached['state'] = None
-        return 'Move not confirmed. Check Trash and refresh (u) before retrying; private diagnostics suppressed.'
+        if destination is not None and destination != configured_folder(row['account'], role):
+            return 'Destination changed; confirm it again. Nothing changed.'
+        result = move_to_trash(row, destination) if role == 'trash' else transfer_message(row, destination)
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, KeyboardInterrupt) as error:
+        for (account, _), cached in FOLDER_CACHE.copy().items():
+            if account == row['account']:
+                cached['state'] = None
+        return str(error) if isinstance(error, MailActionError) else 'Move not confirmed. Check the destination and refresh (u) before retrying; private diagnostics suppressed.'
     key = message_cache_key(row)
     TRASHED_MESSAGES.add(key)
+    if result and result.get('gmail') and role in ('trash', 'delete') and normalized_id(row.get('message-id')):
+        # Gmail labels share one message; stale All Mail/Sent copies must not
+        # resurrect a message just moved to Trash or permanently removed.
+        for (account, _), item in FOLDER_CACHE.copy().items():
+            if account == row['account']:
+                TRASHED_MESSAGES.update(message_cache_key(copy) for copy in item['rows']
+                                        if normalized_id(copy.get('message-id')) == normalized_id(row['message-id'])
+                                        and (role == 'delete' or not copy.get('in_trash')))
     SEEN_STATES.pop(key, None)
     with MESSAGE_CACHE_LOCK:
         MESSAGE_CACHE.pop(key, None)
@@ -808,8 +1031,12 @@ def trash_message(screen: curses.window, row: dict) -> str:
         cached['state'] = None
         cached['rows'] = without_trashed(cached['rows'])
     write_header_cache()
-    start_refresh()
-    return 'Moved to Trash. You can restore it from Trash in Thunderbird or webmail.'
+    # Only this account changed. Other account headers stay available and do
+    # not pay for another listing/login after each individual move.
+    start_refresh([row['account']])
+    return {'trash': 'Moved to Trash. Press T to view it; I restores it to Inbox.',
+            'archive': 'Archived. Press A to view archived mail.',
+            'inbox': 'Restored to Inbox.', 'delete': 'Permanently deleted this one message.'}[role]
 
 
 def conversations(rows: list[dict]) -> list[list[dict]]:
@@ -1115,7 +1342,7 @@ def read_message(row: dict) -> str:
         raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
 
 
-def show_message(screen: curses.window, row: dict) -> None:
+def show_message(screen: curses.window, row: dict) -> str | None:
     """Read a message and reply without leaving the interactive browser."""
     screen.erase()
     put_line(screen, 0, 'Opening message... q back')
@@ -1141,16 +1368,20 @@ def show_message(screen: curses.window, row: dict) -> None:
         raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
     status = mark_seen([row], True)
     while True:
-        key = text_view(screen, text, 'r/R reply/all | * read/unread | x trash | a attachments | / search | q back',
-                        {'r', 'R', '*', 'x', 'a', 'q'}, status)
+        actions = 'X delete permanently | I restore' if row.get('in_trash') else 'x trash | e archive'
+        key = text_view(screen, text, f'r/R reply | * read/unread | {actions} | a attachments | / search | q back',
+                        {'r', 'R', '*', 'x', 'e', 'X', 'I', 'a', 'q'}, status)
         if key == 'q':
             return
         if key == '*':
             status = mark_seen([row], is_unread(row))
-        elif key == 'x':
-            status = trash_message(screen, row)
+        elif key in ('x', 'e', 'X', 'I'):
+            if key in ('X', 'I') and not row.get('in_trash'):
+                status = 'Open Trash (T) to restore or permanently delete a message.'
+                continue
+            status = trash_message(screen, row) if key == 'x' else folder_action(screen, row, {'e': 'archive', 'X': 'delete', 'I': 'inbox'}[key])
             if message_cache_key(row) in TRASHED_MESSAGES:
-                return
+                return status
         else:
             status = show_attachments(screen, raw) if key == 'a' else compose(screen, row, reply_all=key == 'R')
 
@@ -1939,18 +2170,20 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                 old_thread = {row_anchor(row) for row in rows} if in_thread else set()
                 catalog[:] = fresh
                 if in_thread:
-                    fresh = next((group for group in conversations(fresh)
+                    trash_thread = bool(rows and rows[0].get('in_trash'))
+                    fresh = next((group for group in conversations([row for row in fresh if bool(row.get('in_trash')) == trash_thread])
                                   if any(row_anchor(row) in old_thread for row in group)), [])
                     fresh.sort(key=message_date)
                 rows[:] = fresh
-                if not status.startswith(('Could not save read status', 'Move not confirmed')):
+                if not status or status == 'Refreshed.':
                     status = 'Refreshed.'
             except Exception:
                 status = 'Refresh failed; showing previous headers. Press u to retry.'
-        entries = conversations(rows) if threaded else [[row] for row in rows]
-        if not in_thread and view != 'all':
+        visible = rows if in_thread else [row for row in rows if bool(row.get('in_trash')) == (view == 'trash')]
+        entries = conversations(visible) if threaded else [[row] for row in visible]
+        if not in_thread and view not in ('all', 'trash'):
             entries = [group for group in entries if any(
-                row.get('in_inbox', True) if view == 'inbox' else row.get('sent', False)
+                row.get('in_inbox', True) if view == 'inbox' else row.get('sent', False) if view == 'sent' else row.get('in_archive', False)
                 for row in group)]
         filtered = [group for group in entries if not query or any(
             query.casefold() in ' '.join((clean(row.get('subject', '')), clean(row.get('from', [])),
@@ -1970,8 +2203,10 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         heading = 'Conversation: oldest -> newest' if in_thread else f'Unified {view}'
         timer = ' | auto-refresh 5m' if AUTO_REFRESH_ENABLED else ''
         put_line(screen, 0, f'{heading} | {len(filtered)} {mode} | * unread{timer}', curses.A_BOLD)
-        put_line(screen, 1, 'Enter open | * read/unread | x trash | r/R reply | / filter | q back')
-        put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | t threads' if not in_thread
+        trash_view = view == 'trash' or (in_thread and bool(rows and rows[0].get('in_trash')))
+        actions = 'X delete permanently | I restore' if trash_view else 'x trash | e archive'
+        put_line(screen, 1, f'Enter open | * read/unread | {actions} | r/R reply | / filter | q back')
+        put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | T trash | A archive | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
             put_line(screen, y, entry_line(group), curses.A_REVERSE if y - 3 + top == selected else 0)
@@ -2030,8 +2265,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         elif key == 't' and not in_thread:
             threaded = not threaded
             selected = top = 0
-        elif key in ('i', 's', 'a') and not in_thread:
-            view = {'i': 'inbox', 's': 'sent', 'a': 'all'}[key]
+        elif key in ('i', 's', 'a', 'T', 'A') and not in_thread:
+            view = {'i': 'inbox', 's': 'sent', 'a': 'all', 'T': 'trash', 'A': 'archive'}[key]
             selected = top = 0
             query = ''
         elif key == 'o':
@@ -2042,10 +2277,14 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         elif key == '*' and filtered:
             group = filtered[selected]
             status = mark_seen(group, any(is_unread(row) for row in group))
-        elif key == 'x' and filtered:
+        elif key in ('x', 'e', 'X', 'I') and filtered:
+            if key in ('X', 'I') and not trash_view:
+                status = 'Open Trash (T) to restore or permanently delete a message.'
+                continue
+            role = {'x': 'trash', 'e': 'archive', 'X': 'delete', 'I': 'inbox'}[key]
             group = sorted(filtered[selected], key=message_date)
-            choice = choose(screen, 'Choose ONE message to move to Trash', [entry_line([row]) for row in group]) if len(group) > 1 else 0
-            status = trash_message(screen, group[choice]) if choice is not None else 'Cancelled; nothing moved.'
+            choice = choose(screen, 'Choose ONE message for ' + role, [entry_line([row]) for row in group]) if len(group) > 1 else 0
+            status = (trash_message(screen, group[choice]) if role == 'trash' else folder_action(screen, group[choice], role)) if choice is not None else 'Cancelled; nothing moved.'
         elif key in ('r', 'R', 'c', 'd'):
             try:
                 if key == 'c':
@@ -2094,9 +2333,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
                 if len(group) > 1:
                     browse(screen, sorted(group, key=message_date), 'Conversation', False, True, catalog)
                 else:
-                    show_message(screen, group[0])
-                    if message_cache_key(group[0]) in TRASHED_MESSAGES:
-                        status = 'Moved to Trash. You can restore it from Trash in Thunderbird or webmail.'
+                    status = show_message(screen, group[0]) or ''
             except RuntimeError as error:
                 status = str(error)
 
@@ -2148,6 +2385,7 @@ def read_settings(path: str | None, cache: bool = False) -> None:
     SEEN_QUEUE.clear()
     TRASHED_MESSAGES.clear()
     REFRESH_SEEN_STATES.clear()
+    REFRESH_AGAIN.clear()
     HEADER_CACHE_PATH = None
     HEADER_CACHE_READY = False
     if cache:
@@ -2174,7 +2412,7 @@ def main() -> None:
     parser.add_argument('--config', help='path to a single Himalaya TOML configuration file')
     parser.add_argument('--outbox', action='store_true', help='open the scheduled-message Outbox directly')
     parser.add_argument('--process-outbox', action='store_true', help='background worker: send due, explicitly queued messages once')
-    parser.epilog = 'Interactive: full conversations across Inbox, Sent and filed mail (excluding Drafts/Trash/Junk). Piped/--list: newest 50 inbox messages unless --all/-n is given.'
+    parser.epilog = 'Interactive: full conversations, plus separate unified Trash and Archive views (excluding Drafts/Junk). Piped/--list: newest 50 inbox messages unless --all/-n is given.'
     args = parser.parse_args()
     if args.process_outbox:
         process_outbox()
