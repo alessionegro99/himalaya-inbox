@@ -15,6 +15,7 @@ Reply identifiers: https://www.rfc-editor.org/rfc/rfc5322#section-3.6.4
 import argparse
 import base64
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 import curses
 from datetime import datetime, timezone
 from email import policy
@@ -24,6 +25,7 @@ from email.message import EmailMessage
 from email.parser import BytesParser, Parser
 from email.utils import format_datetime, formataddr, getaddresses, make_msgid
 from html.parser import HTMLParser
+from http.cookiejar import CookieJar
 import hashlib
 import imaplib
 import json
@@ -33,6 +35,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import ssl
 import stat
@@ -44,7 +47,10 @@ from threading import Event, Lock, Semaphore, Thread
 import tomllib
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.error import HTTPError
+from urllib.parse import quote, unquote, urlsplit
+from urllib.request import HTTPSHandler, HTTPCookieProcessor, HTTPRedirectHandler, Request, build_opener
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from collections import OrderedDict, deque
 from collections.abc import Iterator
@@ -2012,6 +2018,592 @@ def editor_environment() -> Iterator[dict[str, str]]:
                    HIMALAYA_INBOX_INIT=paths['init.lua'], HIMALAYA_INBOX_CONTACTS=paths['contacts.json'])
 
 
+class VacationError(RuntimeError):
+    """An actionable error containing no raw server or credential diagnostics."""
+
+
+def vacation_profiles() -> dict:
+    """Opt in accounts locally; no configuration ever means no enabled replies."""
+    path = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'himalaya-inbox/vacation.toml'
+    if not path.exists():
+        return {}
+    try:
+        profiles = tomllib.loads(path.read_text(encoding='utf-8'))['accounts']
+        for account, profile in profiles.items():
+            imap = SETTINGS[account]['imap']
+            host = urlsplit(imap['server']).hostname
+            if profile['backend'] == 'sieve':
+                if (set(profile) - {'backend', 'host', 'port'} or profile.get('host') != host
+                        or type(profile.get('port', 4190)) is not int or not 1 <= profile.get('port', 4190) <= 65535):
+                    raise ValueError()
+            elif profile['backend'] == 'sogo':
+                url = urlsplit(profile['url'])
+                if (set(profile) - {'backend', 'url'} or url.scheme != 'https' or url.hostname != host or url.username or url.password
+                        or url.query or url.fragment or url.port not in (None, 443) or not url.path.endswith('/')):
+                    raise ValueError()
+            else:
+                raise ValueError()
+        return profiles
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise VacationError('Invalid local vacation.toml; each endpoint must match its IMAP account host.') from None
+
+
+def vacation_auth(account: str) -> tuple[str, str]:
+    """Reuse a captured credential helper, never a shell or terminal echo."""
+    auth = SETTINGS[account]['imap']['sasl']['plain']
+    command = auth['password']['command']
+    if (not isinstance(command, list) or not command or not all(isinstance(x, str) for x in command)
+            or not isinstance(auth['username'], str) or '\0' in auth['username']):
+        raise VacationError('Vacation controls require command-based plain-password authentication.')
+    password = run_command_private(command).decode('utf-8').rstrip('\r\n')
+    if not password or '\0' in password:
+        raise VacationError('The account credential helper returned an invalid password.')
+    return auth['username'], password
+
+
+def vacation_text(text: str) -> str:
+    """Bound plain text before either transport encodes it."""
+    text = text.replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not text or len(text.encode('utf-8')) > 16384 or any(ord(c) < 32 and c not in '\n\t' for c in text):
+        raise VacationError('Write a nonempty message of at most 16 KiB, without control characters.')
+    return text
+
+
+def sieve_quote(value: str) -> bytes:
+    """Encode one ManageSieve quoted string (RFC 5804 section 1.2)."""
+    if any(c in value for c in '\r\n\0'):
+        raise VacationError('Invalid Sieve string; nothing changed.')
+    return ('"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"').encode('utf-8')
+
+
+def sieve_reply(stream) -> list[list[bytes]]:
+    """Read bounded quoted/literal responses; literal text is never a status line."""
+    rows, used = [], 0
+    for _ in range(200):
+        line = stream.readline(65537)
+        used += len(line)
+        if not line.endswith(b'\r\n') or len(line) > 65536:
+            raise VacationError('Invalid response from the filter server.')
+        status = line.split(b' ', 1)[0].strip()
+        if status in (b'OK', b'NO', b'BYE'):
+            if status != b'OK':
+                raise VacationError('The filter server rejected the request; private diagnostics suppressed.')
+            return rows
+        tokens = []
+        while True:
+            line = line[:-2]
+            while line:
+                match = re.match(rb' *(?:"((?:[^"\\]|\\["\\])*)"|([^ "{}]+)|\{([0-9]+)\})', line)
+                if not match:
+                    raise VacationError('Unsupported response from the filter server.')
+                line = line[match.end():]
+                if match[3] is not None:
+                    size = int(match[3])
+                    used += size
+                    if line or used > 1024 * 1024:
+                        raise VacationError('Filter response exceeds the safe limit.')
+                    literal = stream.read(size)
+                    if len(literal) != size:
+                        raise VacationError('Incomplete response from the filter server.')
+                    tokens.append(literal)
+                    line = stream.readline(65537)
+                    used += len(line)
+                    if not line.endswith(b'\r\n') or len(line) > 65536:
+                        raise VacationError('Invalid literal terminator from the filter server.')
+                    break
+                tokens.append(re.sub(rb'\\(["\\])', rb'\1', match[1]) if match[1] is not None else match[2])
+            else:
+                break
+        if used > 1024 * 1024:
+            raise VacationError('Filter response exceeds the safe limit.')
+        rows.append(tokens)
+    raise VacationError('Too many filter-server response lines.')
+
+
+VACATION_SCRIPTS = ('himalaya-inbox-vacation-a', 'himalaya-inbox-vacation-b')
+VACATION_MARKER = b'# himalaya-inbox-vacation v1 '
+
+
+def vacation_script(base: str, address: str, text: str) -> bytes:
+    """Wrap, never rewrite, original rules; their stop actions still take priority.
+
+    Include: RFC 6609. Vacation (including loop prevention): RFC 5230.
+    Metadata is accepted only when the complete script matches this generator.
+    """
+    text = vacation_text(text)
+    if base in VACATION_SCRIPTS:
+        raise VacationError('Refusing a recursive vacation filter.')
+    metadata = json.dumps({'base': base, 'address': address, 'text': text}, sort_keys=True, ensure_ascii=True).encode()
+    script = VACATION_MARKER + metadata + b'\r\nrequire ["include", "vacation"];\r\n'
+    if base:
+        script += b'include :personal ' + sieve_quote(base) + b';\r\n'
+    script += (b'if allof (not exists ["List-Id", "List-Post", "List-Unsubscribe", "Mailing-List"],\r\n'
+               b'  not header :is "Precedence" ["bulk", "list", "junk"],\r\n'
+               b'  anyof (not exists "Auto-Submitted", header :is "Auto-Submitted" "no"),\r\n'
+               b'  not header :is "X-Spam-Flag" "YES", not header :matches "X-Spam-Status" "Yes,*") {\r\n'
+               b'  vacation :days 7 :addresses [' + sieve_quote(address) + b'] text:\r\n')
+    script += '\r\n'.join('.' + line if line.startswith('.') else line for line in text.split('\n')).encode('utf-8')
+    return script + b'\r\n.\r\n;\r\n}\r\n'
+
+
+def vacation_metadata(script: bytes) -> dict:
+    """Reject name collisions or externally edited managed scripts."""
+    try:
+        if not script.startswith(VACATION_MARKER):
+            raise ValueError()
+        value = json.loads(script.split(b'\r\n', 1)[0][len(VACATION_MARKER):])
+        if set(value) != {'base', 'address', 'text'} or not all(isinstance(x, str) for x in value.values()):
+            raise ValueError()
+        if vacation_script(**value) != script:
+            raise ValueError()
+        return value
+    except (ValueError, TypeError, VacationError):
+        raise VacationError('A reserved vacation filter was changed outside this client; refusing to overwrite it.') from None
+
+
+class SieveVacation:
+    """Small STARTTLS-only ManageSieve client; no delete/rename commands."""
+
+    def __init__(self, account: str, profile: dict):
+        self.account, self.profile = account, profile
+        self.sock = self.stream = None
+
+    def connect(self) -> None:
+        host = self.profile['host']
+        self.sock = socket.create_connection((host, self.profile.get('port', 4190)), timeout=12)
+        self.stream = self.sock.makefile('rb')
+        sieve_reply(self.stream)
+        self.command(b'STARTTLS')
+        self.stream.close()
+        self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=host)
+        self.stream = self.sock.makefile('rb')
+        caps = dict((row[0].upper(), row[1:]) for row in sieve_reply(self.stream))
+        if b'PLAIN' not in b' '.join(caps.get(b'SASL', [])).split():
+            raise VacationError('The filter server does not offer password authentication over TLS.')
+        username, password = vacation_auth(self.account)
+        payload = base64.b64encode(b'\0' + username.encode() + b'\0' + password.encode())
+        self.command(b'AUTHENTICATE "PLAIN" "' + payload + b'"')
+        caps = dict((row[0].upper(), row[1:]) for row in self.command(b'CAPABILITY'))
+        if not {b'vacation', b'include'} <= set(b' '.join(caps.get(b'SIEVE', [])).split()):
+            raise VacationError('This filter server needs the vacation and include extensions.')
+
+    def close(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+        if self.sock is not None:
+            self.sock.close()
+
+    def command(self, command: bytes) -> list[list[bytes]]:
+        self.sock.sendall(command + b'\r\n')
+        return sieve_reply(self.stream)
+
+    def get_script(self, name: str) -> bytes:
+        rows = self.command(b'GETSCRIPT ' + sieve_quote(name))
+        if len(rows) != 1 or len(rows[0]) != 1:
+            raise VacationError('The filter server returned an invalid script.')
+        return rows[0][0]
+
+    def read(self) -> dict:
+        scripts = self.command(b'LISTSCRIPTS')
+        active = [row[0].decode('utf-8') for row in scripts if row[1:] == [b'ACTIVE']]
+        if len(active) > 1:
+            raise VacationError('Unexpected active filter state.')
+        name = active[0] if active else ''
+        content = self.get_script(name) if name else b''
+        managed = name in VACATION_SCRIPTS
+        data = vacation_metadata(content) if managed else {'base': name, 'text': ''}
+        original = self.get_script(data['base']) if managed and data['base'] else content if not managed else b''
+        # Conservative refusal is safer than guessing how another vacation,
+        # nested script, or reject action interacts with this new action.
+        if re.search(rb'\b(vacation|include|reject|ereject)\b', original, re.I):
+            raise VacationError('Existing filters need manual review before adding or disabling a vacation reply.')
+        return {'label': 'ON' if managed else 'OFF', 'text': data['text'], 'dates': False,
+                'active': name, 'base': data['base'], 'content': content, 'original': original,
+                'names': [row[0].decode('utf-8') for row in scripts],
+                'stamp': hashlib.sha256(name.encode() + b'\0' + content + b'\0' + original).hexdigest()}
+
+    def write(self, state: dict, enabled: bool, text: str, start: str, end: str) -> None:
+        if start or end:
+            raise VacationError('This account supports manual on/off only, not dates.')
+        target = state['base']
+        if enabled:
+            target = next(name for name in VACATION_SCRIPTS if name != state['active'])
+            if target in state['names']:
+                vacation_metadata(self.get_script(target))
+            content = vacation_script(state['base'], SETTINGS[self.account]['email'], text)
+            self.command(b'PUTSCRIPT ' + sieve_quote(target) + b' {' + str(len(content)).encode() + b'+}\r\n' + content)
+            if self.get_script(target) != content:
+                raise VacationError('Uploaded filter did not verify; it was not activated.')
+        if self.read()['stamp'] != state['stamp']:
+            raise VacationError('Filters changed meanwhile. Refresh before trying again.')
+        self.command(b'SETACTIVE ' + sieve_quote(target))
+        result = self.read()
+        if result['active'] != target or (enabled and result['text'] != vacation_text(text)):
+            raise VacationError('The filter change could not be verified.')
+
+
+class VacationRedirect(HTTPRedirectHandler):
+    """Never forward credentials or cookies to another origin or redirect a POST."""
+
+    def redirect_request(self, request, fp, code, msg, headers, url):
+        if request.data is not None or urlsplit(request.full_url)[:2] != urlsplit(url)[:2]:
+            raise VacationError('Unexpected webmail redirect; no credentials were forwarded.')
+        return super().redirect_request(request, fp, code, msg, headers, url)
+
+
+class VacationPage(HTMLParser):
+    """Extract settings data, without executing webmail JavaScript."""
+
+    def __init__(self):
+        super().__init__()
+        self.capture = False
+        self.template = False
+        self.defaults = ''
+        self.date_controls = set()
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        attrs = dict(attrs)
+        if tag == 'script':
+            self.capture = attrs.get('id') == 'UserDefaults'
+            self.template = attrs.get('type') == 'text/ng-template'
+        model = attrs.get('ng-model', '')
+        if model.endswith(('.Vacation.startDate', '.Vacation.endDate')):
+            self.date_controls.add(model.rsplit('.', 1)[1])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == 'script':
+            self.capture = False
+            self.template = False
+
+    def handle_data(self, data: str) -> None:
+        if self.capture:
+            self.defaults += data
+        if self.template:
+            # Angular embeds its forms inside inert script templates. HTMLParser
+            # correctly treats that markup as data, not ordinary start tags.
+            self.date_controls.update(re.findall(r'''ng-model=["'][^"']*\.Vacation\.(startDate|endDate)["']''', data))
+
+
+def vacation_flag(value) -> bool:
+    return value is True or value == 1 or value == '1'
+
+
+def vacation_dates(start: str, end: str, zone: str, now: datetime | None = None) -> tuple[int | None, int | None]:
+    """Use calendar days in the provider's zone; the last day is inclusive."""
+    try:
+        tz = ZoneInfo(zone)
+        today = (now or datetime.now(tz)).astimezone(tz).date()
+        values = []
+        for value in (start, end):
+            if not value:
+                values.append(None)
+            else:
+                parsed = datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=tz)
+                if parsed.strftime('%Y-%m-%d') != value or parsed.date() < today:
+                    raise ValueError()
+                values.append(int(parsed.timestamp()))
+        if values[0] is not None and values[1] is not None and values[1] < values[0]:
+            raise ValueError()
+        return tuple(values)
+    except (ValueError, KeyError):
+        raise VacationError('Use YYYY-MM-DD, not in the past, with the end on or after the start.') from None
+
+
+def sogo_vacation_label(defaults: dict, now: datetime | None = None) -> str:
+    vacation = defaults.get('Vacation') or {}
+    if not vacation_flag(vacation.get('enabled')):
+        return 'OFF'
+    tz = ZoneInfo(defaults['SOGoTimeZone'])
+    today = (now or datetime.now(tz)).astimezone(tz).date()
+    if vacation_flag(vacation.get('endDateEnabled')) and today > datetime.fromtimestamp(int(vacation['endDate']), tz).date():
+        return 'OFF (expired)'
+    if vacation_flag(vacation.get('startDateEnabled')) and today < datetime.fromtimestamp(int(vacation['startDate']), tz).date():
+        return 'SCHEDULED'
+    return 'ON'
+
+
+def sogo_vacation_payload(defaults: dict, account: str, enabled: bool, text: str, start: str, end: str) -> dict:
+    """Round-trip all defaults: SOGo's save API REPLACES them, it is not a patch.
+
+    Match Preferences.service.js / UIxPreferences.m in Alinto/sogo (see README).
+    Do not post UI 'settings', so calendar/mail view state is left alone.
+    """
+    result = deepcopy(defaults)
+    result.pop('locale', None)
+    if vacation_flag(result.get('SOGoRememberLastModule')):
+        result['SOGoLoginModule'] = 'Last'
+    for account_data in result.get('AuxiliaryMailAccounts', []):
+        account_data['identities'] = [
+            {key: value for key, value in identity.items() if key in ('email', 'fullName', 'replyTo', 'signature', 'isDefault')}
+            for identity in account_data.get('identities', []) if not identity.get('isReadOnly')]
+    # Refuse to override an external script; write() checks this on the server.
+    result['hasActiveExternalSieveScripts'] = False
+    vacation = dict(result.get('Vacation') or {})
+    vacation['enabled'] = int(enabled)
+    if enabled:
+        first, last = vacation_dates(start, end, result['SOGoTimeZone'])
+        vacation.update(autoReplyText=vacation_text(text), autoReplyEmailAddresses=[SETTINGS[account]['email']],
+                        daysBetweenResponse=7, ignoreLists=1, alwaysSend=0, discardMails=0,
+                        customSubjectEnabled=0, startTimeEnabled=0, endTimeEnabled=0, weekdaysEnabled=0, days=[])
+        for name, stamp in (('startDate', first), ('endDate', last)):
+            vacation.pop(name, None)
+            vacation.pop(name + 'Enabled', None)
+            if stamp is not None:
+                vacation[name], vacation[name + 'Enabled'] = stamp, 1
+    result['Vacation'] = vacation
+    return {'defaults': result}
+
+
+class SOGoVacation:
+    """Use SOGo's own preference API over verified HTTPS, with ephemeral cookies."""
+
+    def __init__(self, account: str, profile: dict):
+        self.account, self.root = account, profile['url']
+        self.base = None
+        self.cookies = CookieJar()
+        self.opener = build_opener(HTTPSHandler(context=ssl.create_default_context()),
+                                   HTTPCookieProcessor(self.cookies), VacationRedirect())
+
+    def request(self, url: str, data: dict | None = None) -> tuple[int, bytes]:
+        if urlsplit(url)[:2] != urlsplit(self.root)[:2]:
+            raise VacationError('Cross-origin webmail request refused.')
+        # SOGo gates even its API on a browser-compatible User-Agent.
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'}
+        # Mirror Angular's same-origin CSRF header without ever printing the token.
+        for cookie in self.cookies:
+            if cookie.name == 'XSRF-TOKEN' and cookie.domain.lstrip('.') == urlsplit(self.root).hostname:
+                headers['X-XSRF-TOKEN'] = unquote(cookie.value)
+        if data is not None:
+            headers.update({'Content-Type': 'application/json', 'Origin': 'https://' + urlsplit(self.root).netloc,
+                            'Referer': self.root})
+        with self.opener.open(Request(url, headers=headers, data=json.dumps(data).encode() if data is not None else None), timeout=15) as response:
+            body = response.read(2 * 1024 * 1024 + 1)
+            if len(body) > 2 * 1024 * 1024:
+                raise VacationError('Webmail response exceeds the safe size limit.')
+            return response.status, body
+
+    def connect(self) -> None:
+        username, password = vacation_auth(self.account)
+        status, body = self.request(self.root + 'connect', {'userName': username, 'password': password, 'rememberLogin': 0})
+        data = json.loads(body)
+        if status != 200 or not isinstance(data.get('username'), str) or data.get('totpEnabled'):
+            raise VacationError('Webmail needs interactive authentication; use its website.')
+        self.base = self.root + 'so/' + quote(data['username'], safe='') + '/'
+
+    def close(self) -> None:
+        if self.base:
+            try:
+                self.request(self.base + 'logoff')
+            except Exception:
+                pass
+        self.cookies.clear()
+
+    def read(self) -> dict:
+        _, html = self.request(self.base + 'Preferences')
+        page = VacationPage()
+        page.feed(html.decode('utf-8'))
+        defaults = json.loads(page.defaults)
+        if not isinstance(defaults, dict) or 'SOGoTimeZone' not in defaults:
+            raise VacationError('Webmail did not return recognizable preferences.')
+        try:
+            self.request(self.base + 'activeExternalSieveScripts')
+        except HTTPError as error:
+            if error.code != 404:
+                raise VacationError('Webmail cannot verify its mail filters (HTTP %d). No change made; check webmail before retrying.' % error.code) from None
+        else:
+            raise VacationError('An external filter script is active; refusing to replace it with webmail settings.')
+        vacation = defaults.get('Vacation') or {}
+        capabilities = re.search(r'\bsieveCapabilities\s*=\s*(\[[^\]]*\])', html.decode('utf-8'), re.S)
+        # Require a server-clock date rule, not an unverified cron/laptop timer.
+        date_capability = capabilities is not None and 'date' in json.loads(capabilities[1])
+        return {'label': sogo_vacation_label(defaults), 'text': vacation.get('autoReplyText', ''),
+                'dates': date_capability and page.date_controls == {'startDate', 'endDate'}, 'zone': defaults['SOGoTimeZone'],
+                'defaults': defaults, 'stamp': hashlib.sha256(json.dumps(defaults, sort_keys=True).encode()).hexdigest()}
+
+    def write(self, state: dict, enabled: bool, text: str, start: str, end: str) -> None:
+        if (start or end) and not state['dates']:
+            raise VacationError('The provider has not enabled date-based automatic replies.')
+        payload = sogo_vacation_payload(state['defaults'], self.account, enabled, text, start, end)
+        self.request(self.base + 'Preferences/save', payload)
+        result = self.read()
+        wanted = payload['defaults']['Vacation']
+        received = result['defaults'].get('Vacation') or {}
+        if any(received.get(key) != value for key, value in wanted.items()):
+            raise VacationError('Saved vacation preferences did not verify. Check webmail before retrying.')
+        for key in ('SOGoSieveFilters', 'Forward', 'Notification'):
+            if state['defaults'].get(key) != result['defaults'].get(key):
+                raise VacationError('Other mail rules changed during the update. Check webmail before retrying.')
+
+
+@contextmanager
+def vacation_connection(account: str, profile: dict):
+    backend = SieveVacation(account, profile) if profile['backend'] == 'sieve' else SOGoVacation(account, profile)
+    try:
+        backend.connect()
+        yield backend
+    except VacationError:
+        raise
+    except Exception:
+        raise VacationError('Cannot access vacation settings; private diagnostics suppressed. Nothing is assumed OFF.') from None
+    finally:
+        try:
+            backend.close()
+        except Exception:
+            pass  # Cleanup failure must not expose server data or hide the result.
+
+
+def vacation_read(account: str, profile: dict) -> dict:
+    with vacation_connection(account, profile) as backend:
+        return backend.read()
+
+
+def vacation_change(account: str, profile: dict, expected: dict, enabled: bool,
+                    text: str = '', start: str = '', end: str = '') -> dict:
+    """Only called after explicit confirmation; no automatic retries or startup writes."""
+    with vacation_connection(account, profile) as backend:
+        current = backend.read()
+        if current['stamp'] != expected['stamp']:
+            raise VacationError('Settings changed since your review. Refresh and review again; nothing changed here.')
+        try:
+            backend.write(current, enabled, text, start, end)
+            return backend.read()
+        except Exception:
+            raise VacationError('Change not confirmed. The server may have applied it: refresh/check webmail before retrying. Private diagnostics suppressed.') from None
+
+
+def vacation_draft_path(account: str, profile: dict) -> Path:
+    identity = json.dumps([CONFIG_ARGS, account, SETTINGS[account].get('email'), profile], sort_keys=True)
+    directory = draft_directory().parent / 'vacation'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    directory.chmod(0o700)
+    return directory / (hashlib.sha256(identity.encode()).hexdigest() + '.txt')
+
+
+def vacation_edit(screen: curses.window, path: Path, initial: str = '') -> None:
+    """Editing is strictly local. Even :wq cannot send or activate anything."""
+    editor = shutil.which('nvim')
+    if not editor:
+        raise VacationError('Neovim is unavailable.')
+    with tempfile.TemporaryDirectory(prefix='himalaya-vacation-') as directory:
+        draft = Path(directory) / 'reply.txt'
+        save_draft(draft, path.read_text(encoding='utf-8') if path.exists() else initial)
+        with editor_environment() as environment, terminal_child(screen):
+            result = subprocess.run([editor, '-u', 'NONE', '-n', '-i', 'NONE', '--cmd',
+                                     'set nomodeline noswapfile nobackup nowritebackup noundofile',
+                                     '--cmd', 'lua dofile(vim.env.HIMALAYA_INBOX_INIT)',
+                                     '+set filetype=text', '--', str(draft)], env=environment)
+        if result.returncode:
+            return
+        text = vacation_text(draft.read_text(encoding='utf-8'))
+        if text_view(screen, text + '\n\nThis saves a local draft only. The server is not changed.',
+                     's save locally | q cancel', {'s', 'q', '\x1b'}) == 's':
+            save_draft(path, text)
+
+
+def vacation_account(screen: curses.window, account: str, profile: dict, state: dict | None = None) -> None:
+    """Default focus is OFF, never ON; activation always requires typed confirmation."""
+    path = vacation_draft_path(account, profile)
+    status = ''
+    while True:
+        label = state['label'] if state else 'UNKNOWN - refresh required'
+        choice = choose(screen, f'Out of office: {account} | {label} | {status}',
+                        ['Turn OFF (keep saved message)', 'Turn ON / update reply',
+                         'Edit saved message (local only)', 'Refresh server status', 'Back'])
+        if choice in (None, 4):
+            return
+        try:
+            if choice == 2:
+                vacation_edit(screen, path, state.get('text', '') if state else '')
+                status = 'Editing never changes the server.'
+                continue
+            put_line(screen, 0, 'Checking server vacation settings...', curses.A_BOLD)
+            screen.refresh()
+            state = vacation_read(account, profile)
+            if choice == 3:
+                status = 'Status checked on server.'
+                continue
+            if choice == 0:
+                if state['label'] == 'OFF':
+                    status = 'Already OFF; no change made.'
+                    continue
+                if text_view(screen, f'Turn automatic replies OFF for {account}?\n\nThis also cancels a scheduled reply. Your saved message is kept.',
+                             'y turn OFF | q cancel', {'y', 'q', '\x1b'}) != 'y':
+                    continue
+                if not path.exists() and state.get('text'):
+                    save_draft(path, state['text'])
+                state = vacation_change(account, profile, state, False)
+                status = 'Turned OFF on the server.'
+                continue
+            if not path.exists():
+                vacation_edit(screen, path, state.get('text', ''))
+            if not path.exists():
+                status = 'No saved message; nothing activated.'
+                continue
+            text = vacation_text(path.read_text(encoding='utf-8'))
+            start = end = ''
+            if profile['backend'] == 'sogo':
+                if not state['dates']:
+                    raise VacationError('Date controls unavailable on this provider; nothing activated.')
+                start = input_line(screen, 'Start YYYY-MM-DD (blank = now; Esc cancels): ')
+                if start is None:
+                    continue
+                end = input_line(screen, 'Last day YYYY-MM-DD (blank = manual off; Esc cancels): ')
+                if end is None:
+                    continue
+                vacation_dates(start, end, state['zone'])
+            schedule = (f'Start: {start or "now"}\nLast day (inclusive): {end or "until manually turned off"}\n'
+                        f'Time zone: {state["zone"]}' if profile['backend'] == 'sogo' else
+                        'Starts now. NO AUTOMATIC EXPIRY: you must turn this account off yourself.')
+            preview = (f'Account: {account}\n{schedule}\n\n{text}\n\n'
+                       'Directly addressed mail only; mailing lists skipped; at most one reply per sender per 7 days.\n'
+                       'Existing filters run first. Incoming mail is not discarded. Runs with your laptop off.')
+            if text_view(screen, preview, 'y continue to activation confirmation | q cancel', {'y', 'q', '\x1b'}) != 'y':
+                continue
+            if input_line(screen, 'Type TURN ON to activate (anything else cancels): ') != 'TURN ON':
+                status = 'Cancelled; nothing activated.'
+                continue
+            save_draft(path, text)
+            state = vacation_change(account, profile, state, True, text, start, end)
+            status = 'Confirmed on server.'
+        except (RuntimeError, OSError, ValueError) as error:
+            state = None
+            message = str(error) if isinstance(error, VacationError) else 'Vacation operation failed; private diagnostics suppressed.'
+            text_view(screen, message, 'q back (no automatic retry)', {'q', '\x1b'})
+            status = 'Refresh before retrying.'
+
+
+def vacation_view(screen: curses.window) -> None:
+    """Opening the menu only reads; absent config never opts in other accounts."""
+    try:
+        profiles = vacation_profiles()
+    except VacationError as error:
+        text_view(screen, str(error), 'q back', {'q', '\x1b'})
+        return
+    if not profiles:
+        text_view(screen, 'No accounts configured for vacation controls. See README: Out of office.\nNo automatic replies are enabled by installing or opening this client.', 'q back', {'q', '\x1b'})
+        return
+    accounts = list(profiles)
+    states = {}
+    for account in accounts:
+        put_line(screen, 0, f'Checking out-of-office status: {account}...', curses.A_BOLD)
+        screen.refresh()
+        try:
+            states[account] = vacation_read(account, profiles[account])
+        except VacationError:
+            states[account] = None
+    while True:
+        index = choose(screen, 'Out of office (server-side; nothing enabled automatically)',
+                       [f'{account}: {states[account]["label"] if states[account] else "UNKNOWN - open and refresh for details"}' for account in accounts])
+        if index is None:
+            return
+        account = accounts[index]
+        vacation_account(screen, account, profiles[account], states[account])
+        try:
+            states[account] = vacation_read(account, profiles[account])
+        except VacationError:
+            states[account] = None
+
+
 def compose(screen: curses.window, row: dict | None = None, reply_all: bool = False,
             draft_path: Path | None = None) -> str:
     """Edit in Neovim; saving or quitting the editor never sends a message."""
@@ -2206,7 +2798,7 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
         trash_view = view == 'trash' or (in_thread and bool(rows and rows[0].get('in_trash')))
         actions = 'X delete permanently | I restore' if trash_view else 'x trash | e archive'
         put_line(screen, 1, f'Enter open | * read/unread | {actions} | r/R reply | / filter | q back')
-        put_line(screen, 2, 'c compose | d drafts | o outbox | u refresh | i inbox | s sent | a all | T trash | A archive | t threads' if not in_thread
+        put_line(screen, 2, 'c compose | v out-of-office | d drafts | o outbox | u refresh | i inbox | s sent | a all | T trash | A archive | t threads' if not in_thread
                  else 'Select a message to reply to it. Press u to refresh this conversation.')
         for y, group in enumerate(filtered[top:top + page], 3):
             put_line(screen, y, entry_line(group), curses.A_REVERSE if y - 3 + top == selected else 0)
@@ -2271,6 +2863,8 @@ def browse(screen: curses.window, rows: list[dict], title: str = 'Unified inbox'
             query = ''
         elif key == 'o':
             outbox_view(screen)
+        elif key == 'v':
+            vacation_view(screen)
         elif key == 'u':
             if REFRESH_JOB is None:
                 start_refresh()
@@ -2411,9 +3005,22 @@ def main() -> None:
     parser.add_argument('--flat', action='store_true', help='start with individual messages instead of conversations')
     parser.add_argument('--config', help='path to a single Himalaya TOML configuration file')
     parser.add_argument('--outbox', action='store_true', help='open the scheduled-message Outbox directly')
+    parser.add_argument('--vacation', action='store_true', help='open out-of-office controls directly; never enables replies by itself')
     parser.add_argument('--process-outbox', action='store_true', help='background worker: send due, explicitly queued messages once')
     parser.epilog = 'Interactive: full conversations, plus separate unified Trash and Archive views (excluding Drafts/Junk). Piped/--list: newest 50 inbox messages unless --all/-n is given.'
     args = parser.parse_args()
+    if args.vacation:
+        if args.process_outbox or args.outbox or args.list or args.all or args.limit is not None or args.flat:
+            parser.error('--vacation cannot be combined with mail-list or outbox modes')
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error('--vacation requires an interactive terminal')
+        read_settings(args.config)
+        IO_STOP.clear()
+        try:
+            curses.wrapper(vacation_view)
+        finally:
+            stop_background()
+        return
     if args.process_outbox:
         process_outbox()
         return

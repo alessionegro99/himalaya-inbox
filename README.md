@@ -19,6 +19,7 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Shows the message for review and queues it with a cancellable five-minute delay by default.
 - Offers a custom delay or an explicit send-now confirmation.
 - Keeps unfinished drafts locally so you can resume them.
+- Provides explicitly confirmed server-side out-of-office controls for opted-in ManageSieve and SOGo accounts; installation and editing never enable replies.
 
 The inbox is still the starting view: a thread appears there if it contains an Inbox message. Sent and Archive have their own views; All combines regular indexed mail. Trash is indexed separately and never mixed into those views or their threads. Drafts and Junk are excluded. Unrelated messages with identical subjects are not merged; missing or malformed threading headers can still leave messages separate.
 
@@ -69,6 +70,7 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | `X` in Trash | Permanently delete one message: confirm and type `DELETE` |
 | `r` / `R` | Reply / reply to all |
 | `c` | Compose a new message; choose the sending account |
+| `v` | Out of office: check status, edit a local reply, explicitly turn on/off |
 | `d` | Resume a local draft |
 | `o` | Outbox: see countdowns and press `x` to cancel pending mail |
 | `i` / `s` / `a` | Inbox / Sent / all indexed mail |
@@ -95,6 +97,37 @@ Press `e` in the list or reader to archive one message; press `A` in the list to
 Moves use one verified-TLS IMAP connection for authentication, source-folder UID-validity and Message-ID checks, and the operation. Servers advertising `MOVE` use `UID MOVE`. Otherwise, the client confirms `UID COPY` and its exact `COPYUID` receipt **before** flagging the original and issuing `UID EXPUNGE` for only that UID. A failed copy never removes the original. Permanent deletion also uses only `UID EXPUNGE`; the client never issues a mailbox-wide `EXPUNGE` or `CLOSE`. See [RFC 6851](https://www.rfc-editor.org/rfc/rfc6851) and [RFC 4315](https://www.rfc-editor.org/rfc/rfc4315).
 
 After success, the old UID is removed from the local views/caches and only the affected account refreshes in the background. A move during an existing refresh schedules a follow-up read, not another move. Network confirmation can still take a few seconds. An error identifies whether verification failed, a copy was confirmed but removal was uncertain, or the move/deletion was not confirmed. Raw server/helper diagnostics remain private. **Check the relevant folders and refresh before retrying an uncertain action.** Tests use synthetic mail and do not move or delete real emails.
+
+### Out of office (off by default)
+
+Press `v`, or run `inbox --vacation` / `himalaya-inbox --vacation` to open the controls without loading mail. Only explicitly configured accounts appear. **Installing, starting, opening the menu, and saving a message never enable an automatic reply.** Existing server settings are read, not reset on every launch. A connection or verification failure shows **UNKNOWN**, never a guessed OFF.
+
+1. Select an account and check its live status: OFF, ON, SCHEDULED, or UNKNOWN.
+2. **Edit saved message** opens isolated Neovim. Use `:wq`, review and press `s` to save locally. This does not change a live reply, even if one is already on.
+3. **Turn ON / update reply** reuses that draft. For SOGo, enter a start date (blank means now) and an inclusive last day (blank means manual off), in `YYYY-MM-DD` format. Dates use the webmail account's time zone. ManageSieve accounts use manual on/off only.
+4. Review the account, message and dates, press `y`, then type exactly **`TURN ON`**. This is the only activation path; it also applies a revised message to an already active reply.
+5. **Turn OFF** is the first/default menu choice. Confirm with `y` to disable an active or scheduled reply. The saved message is retained. `q` or Escape cancels.
+
+Replies run on the provider, with no laptop scheduler. The default policy skips mailing lists and replies at most once per sender per seven days, subject to provider rules. Existing filters run first and can stop a vacation reply. Incoming mail is not discarded. An already dispatched automatic reply cannot be recalled. Avoid changing filters simultaneously in another client; detected conflicts abort instead of overwriting them. After an uncertain network result, refresh/check webmail before retrying—changes are never automatically retried.
+
+Opt in accounts in **your private** `$XDG_CONFIG_HOME/himalaya-inbox/vacation.toml` (normally `~/.config/himalaya-inbox/vacation.toml`), using the same account names as your Himalaya configuration. Do not commit this file or your reply drafts. Example:
+
+```toml
+[accounts.work_sieve]
+backend = "sieve"
+host = "imap.example.org"
+port = 4190
+
+[accounts.work_sogo]
+backend = "sogo"
+url = "https://mail.example.org/SOGo/"
+```
+
+There is deliberately no `enabled = true` configuration option. Endpoints must match the corresponding IMAP hostname. Both backends require an existing command-based `sasl.plain.password` credential helper. Credentials and HTTPS cookies are held in memory, never printed or stored by this feature. Saved message text stays in the private state directory, with 700/600 directory/file permissions, separate from ordinary mail drafts and source code. No changes to normal Neovim or phone/Termux configuration are made.
+
+ManageSieve requires verified STARTTLS and `vacation`/`include`. The client creates an inactive wrapper, verifies it, checks for intervening changes, then explicitly activates it; the original script is not edited or deleted. OFF restores the original active script. Two reserved `himalaya-inbox-vacation-*` slots are reused only if their complete contents match this client's format. For safety, existing scripts mentioning vacation, nested include, or reject actions require manual review; externally edited reserved scripts are never overwritten. See [ManageSieve (RFC 5804)](https://www.rfc-editor.org/rfc/rfc5804), [Sieve include (RFC 6609)](https://www.rfc-editor.org/rfc/rfc6609), and [vacation replies (RFC 5230)](https://www.rfc-editor.org/rfc/rfc5230).
+
+SOGo uses its HTTPS preference interface and its same-origin anti-forgery header. Its save operation replaces the defaults, so the client reads and preserves the complete defaults, changes the vacation options, leaves UI settings alone, and verifies the reply and existing mail rules afterward. It refuses to override an external Sieve script or proceed if webmail cannot verify its filters. An unsuccessful check is not proof that replies are off; refresh or check webmail before changing anything. The provider must expose date controls and the Sieve `date` extension; this client does not rely on a provider cron job. See upstream [preferences API](https://github.com/Alinto/sogo/blob/master/UI/PreferencesUI/UIxPreferences.m), [browser serialization](https://github.com/Alinto/sogo/blob/master/UI/WebServerResources/js/Preferences/Preferences.service.js), and [vacation generation](https://github.com/Alinto/sogo/blob/master/SoObjects/SOGo/SOGoSieveManager.m). Tests use synthetic servers; they never activate a live autoresponder.
 
 ### Replying
 
