@@ -33,6 +33,7 @@ def child() -> None:
         source = next(item for item in rows if item['account'] == account and item['id'] == args[-1])
         message['Message-ID'] = '<' + source['message-id'] + '>'
         message.set_content(body)
+        message.add_alternative('<p>HTML body</p><a href="https://example.org/join?token=SYNTHETIC%2Bvalue&amp;group=test">Synthetic invitation</a>', subtype='html')
         message.add_attachment(b'SYNTHETIC_ATTACHMENT', maintype='application', subtype='pdf', filename='terminal file.pdf')
         return {'message': message.as_string()}
 
@@ -41,6 +42,21 @@ def child() -> None:
     inbox.start_refresh = lambda *args: None  # All network operations in this PTY are synthetic.
     flag_calls = []
     move_calls = []
+    link_calls = []
+    viewer_calls = []
+
+    def mock_copy(url):
+        assert url == 'https://example.org/join?token=SYNTHETIC%2Bvalue&group=test'
+        link_calls.append(url)
+        return 'SYNTHETIC_LINK_COPIED'
+
+    def mock_original(raw):
+        assert 'Content-Type: text/html' in raw
+        viewer_calls.append(raw)
+        return 'SYNTHETIC_THUNDERBIRD'
+
+    inbox.copy_link = mock_copy
+    inbox.open_in_thunderbird = mock_original
 
     def fake_move(item, destination):
         assert destination == 'Trash'
@@ -70,6 +86,8 @@ def child() -> None:
             ('test', 'add', '1'), ('test', 'remove', '1'),
             ('test', 'add', '1'), ('other', 'add', '2')]
         assert move_calls == [('other', '2'), ('test', '1')]
+        assert len(link_calls) == 2
+        assert len(viewer_calls) == 1
         assert [(item['account'], item['id']) for item in rows] == [('test', '2')]
 
 
@@ -101,6 +119,17 @@ try:
     expect(b'SYNTHETIC_SINGLE')
     os.write(master, b'\r')
     expect(b'SYNTHETIC_BODY_test_1_LINE_000')
+    os.write(master, b'l')
+    expect(b'LINKS')
+    os.write(master, b'\r')
+    expect(b'SYNTHETIC_LINK_COPIED')
+    os.write(master, b'l')
+    expect(b'LINKS')
+    # xterm SGR mouse press/release on the first link: one click copies it.
+    os.write(master, b'\x1b[<0;5;2M\x1b[<0;5;2m')
+    expect(b'SYNTHETIC_LINK_COPIED')
+    os.write(master, b'h')
+    expect(b'THUNDERBIRD')  # The unchanged SYNTHETIC_ footer prefix is not redrawn.
     # Test read/unread in the real reader. Curses may update just "un" in
     # the footer, so verify the backend call sequence in the child instead.
     os.write(master, b'*a')
@@ -156,7 +185,7 @@ try:
         select.select([master], [], [], 0.05)
     attrs = termios.tcgetattr(master)
     assert attrs[3] & termios.ECHO and attrs[3] & termios.ICANON
-    print('PASS: real terminal navigation, reader search/scroll, Trash confirmation/cancellation, resize, and terminal restoration.')
+    print('PASS: real terminal navigation, link copy by keyboard/mouse, Thunderbird dispatch, reader search/scroll, Trash confirmation/cancellation, resize, and terminal restoration.')
 except BaseException:
     try:
         os.kill(pid, signal.SIGTERM)

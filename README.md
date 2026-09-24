@@ -11,6 +11,8 @@ This is an independent **companion wrapper**, not a fork or an official part of 
 - Groups conversations using `Message-ID`, `In-Reply-To`, and the full `References` ancestry, not subject matching.
 - Includes your own sent replies and archived/filed messages in threads, oldest first.
 - Reads plain text or extracts text from HTML without loading remote images or scripts.
+- Preserves full link destinations (including HTML buttons), with a keyboard/single-click copy menu.
+- Opens the original message in Thunderbird on request, preserving its HTML and attachments.
 - Lists attachments and inline images; saves or opens selected files with your desktop application.
 - Replies, replies to all, and composes new mail in Neovim.
 - Attaches local files to new messages and replies, with a file picker and removable attachments.
@@ -30,6 +32,7 @@ The inbox is still the starting view: a thread appears there if it contains an I
 - Moves/deletion additionally require `imaps://` with standard verified TLS and command-based `sasl.plain.password` or `sasl.xoauth2.token` credentials in the same configuration. Unsupported connection/authentication settings fail safely; browsing and sending still use Himalaya. Servers without `MOVE` need `UIDPLUS` for the safe move fallback; permanent deletion always requires `UIDPLUS`.
 - Linux/Unix terminal, Python 3.12+ with curses, [uv](https://docs.astral.sh/uv/), and Neovim 0.11+.
 - Optional Linux desktop tools: `gio` (GLib) for opening downloaded files, and `xdg-user-dir` for finding your configured Downloads folder. Saving works without these tools.
+- Optional: Thunderbird for the original-message view; `xclip` on X11 or `wl-copy` on Wayland for copying links. On Termux, an existing `termux-clipboard-set` is supported. No terminal/editor configuration changes are required.
 
 ```sh
 git clone https://github.com/alessionegro99/himalaya-inbox.git
@@ -75,6 +78,8 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 | `o` | Outbox: see countdowns and press `x` to cancel pending mail |
 | `i` / `s` / `a` | Inbox / Sent / all indexed mail |
 | `a` inside an open message | Browse attachments; Enter selects a file, then `o` opens or `s` saves it |
+| `l` inside an open message | List links; Enter or a single left click copies the full URL |
+| `h` inside an open message | Open the original email in Thunderbird |
 | `a` / `x` on the compose review screen | Attach a file / remove an attachment |
 | `t` | Toggle conversation grouping |
 | `/` | Filter the list or search an open message |
@@ -85,6 +90,16 @@ Read/unread changes appear immediately and save to the mail server in the backgr
 Within a conversation, messages are oldest first. `You (sent)` identifies sent copies. A reply from a conversation summary targets its latest received message; open the conversation and select another message to reply to that one instead.
 
 Type a number followed by `j` or `k`: `3j` moves down three, `3k` moves up three, and `20j` moves down twenty. This works in the inbox, conversation lists, selection menus, and message reader; Up/Down arrows also accept counts. Movement stops at the beginning/end. The footer shows a pending count; Escape cancels it (and still clears a list filter or closes a menu). Counts apply only to these up/down motions, not to reply, Trash, or other actions. Use `G` to jump straight to the last/newest message in a conversation, then `r` to reply to it.
+
+### Links and the original formatted email
+
+Plain text remains the default. A **Links** section lists complete `http`, `https`, and `mailto` URLs, including HTML button targets even when the message has a separate plain-text body. HTML entities are decoded, but invitation tokens, query strings, and fragments are not rewritten. Bare text URLs use best-effort punctuation detection; the original HTML target takes precedence when identical URLs occur in both alternatives. Scripts, image sources, and attached documents/emails are not searched for links. Nothing is visited or downloaded by extracting links.
+
+Inside a message, press `l`. Select a link with arrows or vim motions and press Enter, or **single-click its row**, to copy its complete destination. A long row may be clipped on screen, but the copied URL is never clipped or wrapped. The menu closes and the reader confirms the copy; `q`/Escape cancels without touching the clipboard. Paste with `Ctrl+Shift+V` in a terminal or `Ctrl+V` in a desktop application. Copied invitation links may remain in your desktop clipboard history. Clipboard helpers receive the URL on standard input, never as a shell command or process argument. See [xclip](https://github.com/astrand/xclip), [wl-clipboard](https://github.com/bugaevc/wl-clipboard), and [Termux's clipboard helper](https://github.com/termux/termux-api-package/blob/master/scripts/termux-clipboard-set.in).
+
+Press `h` to request the original message in **Thunderbird**, using its `-file` option (`thunderbird --help`). This opens a local `.eml` with the original MIME structure, HTML and attachments; it does not compose, send, import the message into a mailbox, or visit an invitation link. Thunderbird must be installed and a graphical desktop must be available. Its existing message-body display and remote-content settings apply; this client does not change them. Thunderbird [blocks remote content by default](https://support.mozilla.org/en-US/kb/remote-content-in-messages), but your existing exceptions/settings may allow it. Reply from `inbox` as usual to retain this client's compose workflow.
+
+Opening in Thunderbird explicitly creates a **private temporary email copy**, `himalaya-inbox-preview-*/message.eml`, in `$XDG_RUNTIME_DIR` (removed when that runtime directory is cleaned up at the end of the user session). Without a valid runtime directory, it uses the system temporary directory and that system's cleanup policy. The directory is mode 700, the file mode 600; filenames contain no sender, subject, or URL. The file stays available after leaving `inbox` because Thunderbird can load it asynchronously and reread attachments. This is an intentional exception to the RAM-only body cache. Close the viewer before manually removing a preview. No preview is created by normal browsing or copying a link.
 
 ### Trash, Archive, and permanent deletion
 
@@ -220,6 +235,7 @@ himalaya-inbox --all | less -S  # piping also selects plain-list mode
 - Header browsing and preloading use read-only/peek fetching. Opening a message marks it read; `*` changes read/unread explicitly. Only the Seen flag is changed; other flags are preserved. These changes synchronize through your mail server to other clients.
 - Headers (including subjects and From/To addresses) are cached as **plaintext** under `$XDG_CACHE_HOME/himalaya-inbox` (default `~/.cache/himalaya-inbox`), with directory permissions 700 and file permissions 600. This cache contains no message bodies, Bcc fields, passwords, OAuth tokens, or account configuration. It is isolated by a hash of the configuration and written atomically. Removing this directory forces a full header reload next time.
 - Message bodies are fetched when highlighted, opened, or used to prepare a reply, without marking messages read. The RAM cache retains at most 16 messages, at most 32 MiB each and 64 MiB combined in UTF-8 encoding, until exit. Refresh preserves only bodies whose account/folder/UID validity/UID/Message-ID still match. Larger messages are not cached. Remote HTML resources are never fetched; terminal control characters are removed before display.
+- Explicit `h` previews create private temporary `.eml` copies for Thunderbird, as described above; Thunderbird uses its own network/privacy settings. Explicit link copies go to the system clipboard and may be retained by clipboard history. Neither operation adds email content or invitation links to this repository or the header cache.
 - Recipient suggestions are collected in memory from loaded address headers, not bodies or Bcc. While editing, Neovim receives a private temporary JSON file (permissions 600 inside a 700 directory), removed when the editor returns. No contacts database, mail cache, or personal editor configuration is included in this repository.
 - Drafts are **plaintext**, stored outside the repository under `$XDG_STATE_HOME/himalaya-inbox/drafts` (default `~/.local/state/himalaya-inbox/drafts`). Directory permissions are 700 and draft files start at 600. Protect the laptop/account and its backups accordingly.
 - The scheduled Outbox is also **plaintext**, in `himalaya-inbox/outbox.sqlite3` beside the drafts directory (permissions 600). Pending or uncertain deliveries retain their bodies. Successful deliveries and cancelled entries retain only status metadata; their queued bodies are removed. This is not a guarantee that older backups contain no copies.
@@ -238,6 +254,8 @@ uv run --no-project --python 3.12 python -m unittest discover -s tests
 ```
 
 Tests cover ordering, paging, account/folder identity, conversation ancestry, MIME rendering, attachment byte round trips and safe downloads, draft attachment persistence, terminal controls, actual pseudo-terminal and Neovim navigation/autocomplete, private temporary contacts and header caches, bounded body caches, shared in-flight downloads, concurrent folder loading, safe change detection, nonblocking refresh and selection stability, automatic read marking, read/unread toggles and ordered saves, refresh races and failed-save rollback, reply recipients, confirmation, fake-clock delays, competing delivery claims, cancellation, and uncertain-delivery behavior. Folder tests cover unified Trash/Archive, Gmail label deduplication, source identity checks, copy-before-removal ordering, UID-scoped expunge, failure suppression, and exact permanent-delete confirmation. All network mutations, credential helpers, and attachment viewers are mocked; no real messages are sent, moved, deleted, or marked by the tests.
+
+Link tests cover MIME alternatives, HTML buttons, exact invitation URLs, unsafe/control-character targets, attachment exclusion, keyboard and real-PTY mouse copying, clipboard backend selection/failures, and private original-message handoff to Thunderbird. Clipboard writes and viewer launches are mocked: tests never read/replace your real clipboard, open real invitations, or start Thunderbird against your accounts.
 
 ## Scope and upstream credit
 

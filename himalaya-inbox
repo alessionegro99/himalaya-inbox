@@ -1088,14 +1088,23 @@ class HtmlText(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.hidden = 0
+        self.links: list[tuple[str, str]] = []
+        self.anchor: tuple[str, int] | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {'head', 'script', 'style'}:
             self.hidden += 1
+        if not self.hidden and tag == 'a':
+            self.finish_link()
+            href = dict(attrs).get('href') or ''
+            if link_url(href.strip()):
+                self.anchor = (href.strip(), len(self.parts))
         if not self.hidden and tag in {'br', 'p', 'div', 'tr', 'li', 'h1', 'h2', 'h3', 'hr'}:
             self.parts.append('\n')
 
     def handle_endtag(self, tag: str) -> None:
+        if not self.hidden and tag == 'a':
+            self.finish_link()
         if tag in {'head', 'script', 'style'}:
             self.hidden = max(0, self.hidden - 1)
         if not self.hidden and tag in {'p', 'div', 'tr', 'li', 'h1', 'h2', 'h3'}:
@@ -1104,6 +1113,144 @@ class HtmlText(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.hidden:
             self.parts.append(' '.join(data.split()) + ' ')
+
+    def finish_link(self) -> None:
+        if self.anchor is not None:
+            url, start = self.anchor
+            self.links.append((clean(''.join(self.parts[start:])) or url, url))
+            self.anchor = None
+
+    def close(self) -> None:
+        super().close()
+        self.finish_link()
+
+
+def link_url(value: str) -> bool:
+    """Accept explicit web/mail links without rewriting invitation tokens."""
+    if not value or any(not char.isprintable() or char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme in {'http', 'https'}:
+            return bool(parsed.hostname) and (parsed.port is None or 0 < parsed.port <= 65535)
+        return parsed.scheme == 'mailto' and bool(parsed.path)
+    except ValueError:
+        return False
+
+
+def text_links(text: str) -> list[tuple[str, str]]:
+    """Recognize bare URLs; HTML href values never use punctuation heuristics."""
+    links = []
+    for match in re.finditer(r'''(?:https?://|mailto:)[^\s<>"']+''', text, re.IGNORECASE):
+        url = match.group()
+        # Query/fragment punctuation can be significant in signed links.
+        if '?' not in url and '#' not in url:
+            url = url.rstrip('.,;')
+        # Parentheses can be part of a URL, or delimit surrounding prose.
+        while url and url[-1] in ')]}' and url.count(url[-1]) > url.count({')': '(', ']': '[', '}': '{'}[url[-1]]):
+            url = url[:-1]
+        if link_url(url):
+            links.append((url, url))
+    return links
+
+
+def message_links(message: EmailMessage) -> list[tuple[str, str]]:
+    """Include HTML button targets even when the displayed body is plain text.
+
+    get_body selects MIME body alternatives, not attached emails/documents:
+    https://docs.python.org/3.12/library/email.message.html#email.message.EmailMessage.get_body
+    """
+    links = []
+    for kind in ('html', 'plain'):
+        body = message.get_body(preferencelist=(kind,))
+        if body is None or body.get_filename():
+            continue
+        content = body.get_content()
+        if kind == 'html':
+            parser = HtmlText()
+            parser.feed(content)
+            parser.close()
+            links.extend(parser.links)
+            content = ''.join(parser.parts)
+        links.extend(text_links(content))
+    unique = {}
+    for label, url in links:
+        unique.setdefault(url, (label, url))
+    return list(unique.values())
+
+
+def copy_link(url: str) -> str:
+    """Copy only on request; pass private URLs through stdin, never the shell."""
+    if not link_url(url):
+        return 'Unsupported link; nothing copied.'
+    if os.environ.get('WAYLAND_DISPLAY') and shutil.which('wl-copy'):
+        command = ['wl-copy', '--type', 'text/plain;charset=utf-8']
+    elif os.environ.get('DISPLAY') and shutil.which('xclip'):
+        command = ['xclip', '-selection', 'clipboard', '-silent']
+    elif shutil.which('termux-clipboard-set'):
+        command = ['termux-clipboard-set']
+    else:
+        return 'No clipboard helper: use xclip (X11), wl-copy (Wayland), or termux-clipboard-set.'
+    try:
+        # xclip/wl-copy keep a background selection owner alive. Do not capture
+        # its output pipes: inherited pipes can make communicate() wait forever.
+        # https://github.com/astrand/xclip/blob/master/xclip.1
+        subprocess.run(command, input=url.encode('utf-8'), stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5, check=True, start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 'Could not copy the link; check your clipboard helper. Private diagnostics suppressed.'
+    return 'Full link copied. Paste with Ctrl+Shift+V in a terminal or Ctrl+V in another app.'
+
+
+def show_links(screen: curses.window, raw: str) -> str:
+    """Choose a link by keyboard or single click; never visit it automatically."""
+    try:
+        links = message_links(BytesParser(policy=policy.default).parsebytes(raw.encode('utf-8')))
+        if not links:
+            return 'No web or mailto links found. Press h to view the original in Thunderbird.'
+        choices = [f'[{index}] ' + (f'{label[:40]} | ' if label != url else '') + url
+                   for index, (label, url) in enumerate(links, 1)]
+        index = choose(screen, 'LINKS', choices, single_click=True, select_label='copy')
+        return copy_link(links[index][1]) if index is not None else ''
+    except Exception:
+        return 'Could not read the links; private diagnostics suppressed.'
+
+
+def open_in_thunderbird(raw: str) -> str:
+    """Open the original MIME message, with a private file kept for the viewer."""
+    executable = shutil.which('thunderbird')
+    if not executable:
+        return 'Thunderbird is not installed. Press l to copy links instead.'
+    if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        return 'Thunderbird needs a graphical desktop. Press l to copy links instead.'
+    directory = path = None
+    try:
+        runtime = os.environ.get('XDG_RUNTIME_DIR') or None
+        if runtime and (not Path(runtime).is_absolute() or not Path(runtime).is_dir()):
+            runtime = None
+        directory = Path(tempfile.mkdtemp(prefix='himalaya-inbox-preview-', dir=runtime))
+        path = directory / 'message.eml'
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, 'wb') as file:
+            file.write(raw.encode('utf-8'))
+        # `thunderbird --help`: -file opens a saved message, not a compose window.
+        process = subprocess.Popen([executable, '-file', str(path)], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        Thread(target=process.wait, name='inbox-thunderbird', daemon=True).start()
+        # A running Thunderbird returns before loading the file and may reread
+        # it for attachments. Keep it until runtime-directory cleanup at logout;
+        # without XDG_RUNTIME_DIR, the system's temporary-file policy applies.
+        return 'Requested Thunderbird. Its HTML and remote-content settings apply.'
+    except (OSError, ValueError, subprocess.SubprocessError):
+        try:
+            if path is not None:
+                path.unlink(missing_ok=True)
+            if directory is not None:
+                directory.rmdir()
+        except OSError:
+            pass  # A cleanup failure must not expose a private path/diagnostic.
+        return 'Could not launch Thunderbird; private diagnostics suppressed.'
 
 
 def attachment_parts(message: EmailMessage) -> list[EmailMessage]:
@@ -1255,8 +1402,14 @@ def message_text(raw: str, row: dict) -> str:
         if body.get_content_type() == 'text/html':
             parser = HtmlText()
             parser.feed(content)
+            parser.close()
             content = '\n'.join(line.strip() for line in ''.join(parser.parts).splitlines() if line.strip())
         lines.append(content)
+    links = message_links(message)
+    if links:
+        lines.extend(['', 'Links (l to copy; h for the original in Thunderbird):'])
+        for index, (label, url) in enumerate(links, 1):
+            lines.extend([f'[{index}]' + (f' {label}' if label != url else ''), url])
     attachments = [attachment_name(part) for part in attachment_parts(message)]
     if attachments:
         lines.extend(['', 'Attachments:', *attachments])
@@ -1374,13 +1527,17 @@ def show_message(screen: curses.window, row: dict) -> str | None:
         raise RuntimeError('Could not render this message; private diagnostics suppressed.') from None
     status = mark_seen([row], True)
     while True:
-        actions = 'X delete permanently | I restore' if row.get('in_trash') else 'x trash | e archive'
-        key = text_view(screen, text, f'r/R reply | * read/unread | {actions} | a attachments | / search | q back',
-                        {'r', 'R', '*', 'x', 'e', 'X', 'I', 'a', 'q'}, status)
+        actions = 'X delete | I restore' if row.get('in_trash') else 'x trash | e archive'
+        key = text_view(screen, text, f'l links | h Thunderbird | r/R reply | * read/unread | {actions} | a files | / find | q back',
+                        {'r', 'R', '*', 'x', 'e', 'X', 'I', 'a', 'l', 'h', 'q'}, status)
         if key == 'q':
             return
         if key == '*':
             status = mark_seen([row], is_unread(row))
+        elif key == 'l':
+            status = show_links(screen, raw)
+        elif key == 'h':
+            status = open_in_thunderbird(raw)
         elif key in ('x', 'e', 'X', 'I'):
             if key in ('X', 'I') and not row.get('in_trash'):
                 status = 'Open Trash (T) to restore or permanently delete a message.'
@@ -1498,17 +1655,19 @@ def text_view(screen: curses.window, text: str, help_text: str,
                     status = 'No match.'
 
 
-def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
+def choose(screen: curses.window, title: str, choices: list[str], *,
+           single_click: bool = False, select_label: str = 'select') -> int | None:
     """Select a list item without entering a shell command."""
     index = count = 0
+    hint = f'Enter{"/click" if single_click else ""} {select_label}'
     while choices:
         screen.erase()
-        put_line(screen, 0, title + ' | Enter select | q cancel', curses.A_BOLD)
+        put_line(screen, 0, title + f' | {hint} | q cancel', curses.A_BOLD)
         page = max(1, screen.getmaxyx()[0] - 2)
         top = max(0, index - page + 1)
         for y, item in enumerate(choices[top:top + page], 1):
             put_line(screen, y, item, curses.A_REVERSE if top + y - 1 == index else 0)
-        footer = 'Enter select | q cancel | arrows/wheel scroll'
+        footer = f'{hint} | q cancel | arrows/wheel scroll'
         if count:
             footer = f'Count: {count} | ' + footer
         put_line(screen, screen.getmaxyx()[0] - 1, footer)
@@ -1546,7 +1705,7 @@ def choose(screen: curses.window, title: str, choices: list[str]) -> int | None:
                 elif buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED):
                     if 1 <= y <= page and top + y - 1 < len(choices):
                         index = top + y - 1
-                        if buttons & curses.BUTTON1_DOUBLE_CLICKED:
+                        if single_click or buttons & curses.BUTTON1_DOUBLE_CLICKED:
                             return index
             except curses.error:
                 pass
